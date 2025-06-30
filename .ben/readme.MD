@@ -1,3 +1,7 @@
+# TODO:
+- finish img embedding script tomorrow
+
+
 # Ben's UV Environment Setup (.ben/pytorch_uv)
 
 This guide walks **new contributors** through creating their own Python 3.10 environment inside the hidden `.ben/` folder and making it available in Jupyter.
