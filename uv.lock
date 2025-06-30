@@ -620,7 +620,7 @@ wheels = [
 ]
 
 [[package]]
-name = "mlx8-w3-transformers"
+name = "mlx8-w4-multimodal-transferlearning"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
