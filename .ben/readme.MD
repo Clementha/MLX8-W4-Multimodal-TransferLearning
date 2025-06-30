@@ -45,8 +45,10 @@ cd ..
 ## 4. Register the Jupyter kernel (one‑off)
 
 ```bash
-python -m ipykernel install --user   --name=pytorch_uv   --display-name "Python (.ben/pytorch_uv)"
-```
+python -m ipykernel install --user   \
+  --name=pytorch_uv   \
+  --display-name "Python (.ben/pytorch_uv)"
+  ```
 
 Select **“Python (.ben/pytorch_uv)”** in VS Code or JupyterLab.
 
@@ -60,6 +62,15 @@ source .ben/pytorch_uv/bin/activate
 
 # Deactivate when done
 deactivate
+```
+
+## 6. To add new 
+Add the dependancy to the toml file.
+
+```bash
+cd .ben
+uv pip compile --output-file uv.lock pyproject.toml
+uv pip sync uv.lock
 ```
 
 ---

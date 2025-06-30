@@ -201,3 +201,4 @@ wandb
 # Ignore env files inside .ben
 .ben/pytorch_uv/
 .ben/uv.lock
+.ben/data/
