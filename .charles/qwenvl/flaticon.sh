@@ -17,6 +17,34 @@ if [[ "$1" == "--unzip" ]]; then
   return 0
 fi
 
+if [[ "$1" == "--split" ]]; then
+  train_dir="$TARGET_DIR/train"
+  test_dir="$TARGET_DIR/test"
+  mkdir -p "$train_dir" "$test_dir"
+  # List only directories (not train/test themselves)
+  folders=()
+  for d in "$TARGET_DIR"/*; do
+    [[ -d "$d" && "$(basename "$d")" != "train" && "$(basename "$d")" != "test" ]] && folders+=("$(basename "$d")")
+  done
+  total=${#folders[@]}
+  if [[ $total -eq 0 ]]; then
+    echo "No folders to split."
+    return 1
+  fi
+  split_idx=$((total * 8 / 10))
+  for i in "${!folders[@]}"; do
+    src="$TARGET_DIR/${folders[$i]}"
+    if (( i < split_idx )); then
+      mv "$src" "$train_dir/"
+      echo "Moved to train: ${folders[$i]}"
+    else
+      mv "$src" "$test_dir/"
+      echo "Moved to test: ${folders[$i]}"
+    fi
+  done
+  return 0
+fi
+
 case "$1" in
   --png|--svg|--eps|--psd)
     TYPE="${1#--}"
@@ -47,7 +75,7 @@ case "$1" in
     done
     ;;
   *)
-    echo "Usage: $0 --unzip | --png [-y] | --svg [-y] | --eps [-y] | --psd [-y]"
+    echo "Usage: $0 --unzip | --split | --png [-y] | --svg [-y] | --eps [-y] | --psd [-y]"
     return 1
     ;;
 esac

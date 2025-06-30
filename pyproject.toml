@@ -22,5 +22,8 @@ dependencies = [
     "scikit-learn>=1.7.0",
     "hdbscan>=0.8.40",
     "scipy>=1.16.0",
+    "transformers>=4.53.0",
+    "qwen-vl-utils[decord]==0.0.8",
+    "accelerate>=1.8.1",
 ]
 
