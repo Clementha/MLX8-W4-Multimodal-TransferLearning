@@ -1,0 +1,26 @@
+[project]
+name = "mlx8-w3-transformers"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "torch",
+    "pyarrow",
+    "torchvision",
+    "datasets",
+    "tqdm",
+    "wandb",
+    "colorama",
+    "pandas",
+    "python-dotenv",
+    "fastapi",
+    "uvicorn",
+    "numpy",
+    "matplotlib>=3.10.3",
+    "seaborn>=0.13.2",
+    "scikit-learn>=1.7.0",
+    "hdbscan>=0.8.40",
+    "scipy>=1.16.0",
+]
+
