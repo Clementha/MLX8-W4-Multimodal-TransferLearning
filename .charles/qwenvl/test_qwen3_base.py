@@ -8,7 +8,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 def test_qwen3_base_model():
     """Test that Qwen3 base model can generate text."""
-    MODEL_NAME = "Qwen/Qwen3-0.6B-Base"
+    MODEL_NAME = "Qwen/Qwen3-0.6B-Base" #"Qwen/Qwen3-0.6B" none base model seems to be slightly better, but still very low quality
     MODEL_DIR = "../.data/hf/models/"
     model_path = os.path.join(MODEL_DIR, MODEL_NAME)
     
