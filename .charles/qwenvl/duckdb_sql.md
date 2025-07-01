@@ -249,3 +249,59 @@ FROM sqlite_db.flaticon_images
 GROUP BY DATE(created_when)
 ORDER BY date_added DESC;
 ```
+
+## 13. Example: Find and Skip Specific Image
+```sql
+-- Find the specific image file
+SELECT 
+    id,
+    collection,
+    type,
+    file,
+    filename,
+    image_path,
+    skipped,
+    updated_when
+FROM sqlite_db.flaticon_images
+WHERE image_path LIKE '%/149086-essential-set/png/battery-9.png';
+
+-- Alternative: Find by collection, type, and filename components
+SELECT 
+    id,
+    collection,
+    type,
+    file,
+    filename,
+    image_path,
+    skipped,
+    updated_when
+FROM sqlite_db.flaticon_images
+WHERE collection = '149086-essential-set'
+  AND type = 'png'
+  AND file = 'battery-9';
+
+-- Mark the specific image as skipped
+UPDATE sqlite_db.flaticon_images 
+SET skipped = 1 
+WHERE image_path LIKE '%/149086-essential-set/png/battery-9.png';
+
+-- Verify the update
+SELECT 
+    id,
+    collection,
+    file,
+    filename,
+    skipped,
+    'Updated successfully' as status
+FROM sqlite_db.flaticon_images
+WHERE image_path LIKE '%/149086-essential-set/png/battery-9.png';
+```
+
+## 14. Shell Command Example
+```bash
+# One-liner to skip specific image using DuckDB CLI
+duckdb -c "INSTALL sqlite; LOAD sqlite; ATTACH '../.data/flaticon_vision_text.sqlite3' AS sqlite_db (TYPE sqlite); UPDATE sqlite_db.flaticon_images SET skipped = 1 WHERE image_path LIKE '%/149629-essential-compilation/png/like-2.png';"
+
+# Alternative with verification
+duckdb -c "INSTALL sqlite; LOAD sqlite; ATTACH '../.data/flaticon_vision_text.sqlite3' AS sqlite_db (TYPE sqlite); UPDATE sqlite_db.flaticon_images SET skipped = 1 WHERE image_path LIKE '%/149629-essential-compilation/png/like-2.png'; SELECT id, collection, file, filename, skipped FROM sqlite_db.flaticon_images WHERE image_path LIKE '%/149629-essential-compilation/png/like-2.png';"
+```
