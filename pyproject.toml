@@ -3,7 +3,7 @@ name = "mlx8-w4-multimodal-transferlearning"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12,<3.14"
+requires-python = ">=3.12"
 dependencies = [
     "torch",
     "pyarrow",
@@ -20,10 +20,20 @@ dependencies = [
     "matplotlib>=3.10.3",
     "seaborn>=0.13.2",
     "scikit-learn>=1.7.0",
-    "hdbscan>=0.8.40",
+    "hdbscan",
     "scipy>=1.16.0",
-    "transformers>=4.53.0",
+    "transformers",
     "qwen-vl-utils[decord]==0.0.8",
-    "accelerate>=1.8.1",
+    "accelerate",
+    "torchaudio",
+    "flash-attn",
+    "unsloth[cu121-ampere-torch230]",
+    "bitsandbytes",
+    "unsloth-zoo",
+    "litellm>=1.73.6",
 ]
+
+# uv add "unsloth[cu121-ampere-torch230] @ git+https://github.com/unslothai/unsloth.git"
+[tool.uv.sources]
+unsloth = { git = "https://github.com/unslothai/unsloth.git" }
 

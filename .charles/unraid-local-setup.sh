@@ -1,8 +1,4 @@
 # Funther setup for unraid local docker development
-# to run `ip a``, `ping 192.168.50.243`, `telnet 192.168.50.243 2230` 
-sudo apt install iproute2
-sudo apt install iputils-ping
-sudo apt install telnet
 
 # talk to the unraid server, note that key only access not enabled
 # ssh -i ~/.ssh/authorized_keys -p 2230 root@192.168.50.243 

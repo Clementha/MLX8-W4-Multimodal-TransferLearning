@@ -1,0 +1,13 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: traing_pair_gen",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/.charles/qwenvl/traing_pair_gen.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/.charles/qwenvl"
+        }
+    ]
+}
