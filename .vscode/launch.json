@@ -24,6 +24,13 @@
             "program": "${workspaceFolder}/.charles/qwenvl/flaticon_datasets.py",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}/.charles/qwenvl"
+        },
+        {
+            "name": "Python: test_openai_clip",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/.charles/qwenvl/test_openai_clip.py",
+            "console": "integratedTerminal"
         }
     ]
 }
