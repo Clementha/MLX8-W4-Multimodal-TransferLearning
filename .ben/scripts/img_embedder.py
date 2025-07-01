@@ -29,12 +29,20 @@ class ImgEmbedder:
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
 
+        # Load feature extractor which will rescale/crop images to fit the input shape
         self.extractor = AutoFeatureExtractor.from_pretrained(model_name)
+        
+        # Load the actual model
         self.model = AutoModel.from_pretrained(model_name).to(self.device)
 
         total_params = sum(p.numel() for p in self.model.parameters())
         model_mb = total_params * 4 / (1024 ** 2)
         print(f"Loaded model '{model_name}' with {total_params:,} params ({model_mb:.2f} MB)")
+
+        # Freeze model by putting it in evaluation mode
+        self.model.eval()               # disable dropout, batchnorm & co.
+        for p in self.model.parameters():
+            p.requires_grad_(False)     # turn off gradient tracking
 
     def embed_batch(self, images: List[Image.Image]) -> Tensor:
         """

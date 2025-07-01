@@ -1,42 +1,45 @@
-# scripts/text_embedder.py
-"""
-Module to fetch pretrained token embeddings for captions using BERT.
-"""
 import torch
 from torch import Tensor
 from typing import List
 from transformers import AutoTokenizer, AutoModel
 
-
 class TextEmbedder:
     """
-    Provides token embeddings from a pretrained BERT embedding layer.
+    Provides token embeddings from a pretrained HF text model.
     """
     def __init__(
         self,
-        model_name: str = "bert-base-uncased",
+        model_name: str = "Qwen/Qwen3-Embedding-0.6B",
         device: torch.device = None
     ) -> None:
-        """
-        Initialize the text embedder.
-
-        Args:
-            model_name: HF model identifier for tokenizer & embeddings.
-            device: torch.device to load embeddings onto (CPU/GPU).
-        """
+        # 1) Decide device once
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # Load tokenizer & model
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        bert = AutoModel.from_pretrained(model_name)
-        # grab just the embedding layer
-        self.embed_layer = bert.get_input_embeddings().to(self.device)
-        print(f"Loaded text embedder '{model_name}' with vocab size {self.embed_layer.num_embeddings} and hidden size {self.embed_layer.embedding_dim}")
+
+        # 2) Load & store the tokenizer (for collate_fn)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            trust_remote_code=True
+        )
+
+        # 3) Load the full model, grab its embedding layer, move to self.device
+        model = AutoModel.from_pretrained(
+            model_name,
+            trust_remote_code=True
+        )
+        self.embed_layer = model.get_input_embeddings().to(self.device)
+
+        # 4) Discard the rest of the model immediately
+        del model
+
+        print(
+            f"Loaded text embedder '{model_name}' "
+            f"(vocab={self.embed_layer.num_embeddings}, "
+            f"dim={self.embed_layer.embedding_dim}) on {self.device}"
+        )
 
     def tokenize(self, captions: List[str], max_length: int = 32) -> dict:
         """
-        Tokenize a list of captions.
-
-        Returns dict with 'input_ids' and 'attention_mask' tensors.
+        Turn list of captions into input_ids & attention_mask.
         """
         return self.tokenizer(
             captions,
@@ -49,12 +52,8 @@ class TextEmbedder:
     def embed_tokens(self, input_ids: Tensor) -> Tensor:
         """
         Look up embeddings for token IDs.
-
-        Args:
-            input_ids: Tensor of shape (B, seq_len)
-        Returns:
-            Tensor (B, seq_len, hidden_size)
         """
-        # Keep on cpu for now to save gpu memory 
+        # move IDs → same device as embedding matrix
         input_ids = input_ids.to(self.device)
+        # fetch embeddings and move them back to CPU
         return self.embed_layer(input_ids).cpu()
