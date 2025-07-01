@@ -43,10 +43,11 @@ class TextEmbedder:
         """
         return self.tokenizer(
             captions,
-            padding="max_length",
-            truncation=True,
-            max_length=max_length,
-            return_tensors="pt"
+            padding="max_length", # add padding tokens up to max_length
+            truncation=True, # Cut off seq's longer than max_length
+            max_length=max_length, # Maximum length of the sequence
+            return_tensors="pt",
+            add_special_tokens=True  # Add special tokens like [CLS] and [SEP]
         )
 
     def embed_tokens(self, input_ids: Tensor) -> Tensor:
