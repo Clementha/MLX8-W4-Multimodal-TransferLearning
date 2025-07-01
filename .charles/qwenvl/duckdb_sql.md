@@ -109,6 +109,25 @@ FROM sqlite_db.processing_count
 WHERE id = 0;
 ```
 
+## 5.1. Find Next Record to Process
+```sql
+-- Find the next immediate record to be processed (lowest ID that's unprocessed and not skipped)
+SELECT 
+    id,
+    collection,
+    type,
+    file,
+    filename,
+    image_path,
+    created_when,
+    scanned_when
+FROM sqlite_db.flaticon_images
+WHERE updated_when IS NULL AND skipped = 0
+ORDER BY id ASC
+LIMIT 1;
+
+```
+
 ## 6. Error Analysis
 ```sql
 -- Find records that were scanned but never processed (potential errors)
@@ -303,5 +322,5 @@ WHERE image_path LIKE '%/149086-essential-set/png/battery-9.png';
 duckdb -c "INSTALL sqlite; LOAD sqlite; ATTACH '../.data/flaticon_vision_text.sqlite3' AS sqlite_db (TYPE sqlite); UPDATE sqlite_db.flaticon_images SET skipped = 1 WHERE image_path LIKE '%/149629-essential-compilation/png/like-2.png';"
 
 # Alternative with verification
-duckdb -c "INSTALL sqlite; LOAD sqlite; ATTACH '../.data/flaticon_vision_text.sqlite3' AS sqlite_db (TYPE sqlite); UPDATE sqlite_db.flaticon_images SET skipped = 1 WHERE image_path LIKE '%/149629-essential-compilation/png/like-2.png'; SELECT id, collection, file, filename, skipped FROM sqlite_db.flaticon_images WHERE image_path LIKE '%/149629-essential-compilation/png/like-2.png';"
+duckdb -c "INSTALL sqlite; LOAD sqlite; ATTACH '../.data/flaticon_vision_text.sqlite3' AS sqlite_db (TYPE sqlite); SELECT id, collection, file, filename, skipped FROM sqlite_db.flaticon_images WHERE image_path LIKE '%/149629-essential-compilation/png/like-2.png';"
 ```

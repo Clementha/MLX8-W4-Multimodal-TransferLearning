@@ -220,3 +220,20 @@ for i in range(min(COUNT, len(image_files))):
 }
 """
 
+
+"""Ollama OpenAI Compatible API Example
+
+ curl http://localhost:11434/v1/chat/completions     -H "Content-Type: application/json"     -d '{
+        "model": "qwen2.5vl",
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant."
+            },
+            {
+                "role": "user",
+                "content": "Hello!"
+            }
+        ]
+    }'
+"""
