@@ -33,7 +33,7 @@ class Flickr30kDataset(Dataset):
             transform: Optional PIL image transform.
         """
         self.df: pd.DataFrame = pd.read_parquet(metadata_path)
-        self.image_dir: Path = image_dir
+        self.image_dir: Path = Path(image_dir)
         self.transform = transform
 
     def __len__(self) -> int:

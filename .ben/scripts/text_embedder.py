@@ -55,5 +55,6 @@ class TextEmbedder:
         Returns:
             Tensor (B, seq_len, hidden_size)
         """
+        # Keep on cpu for now to save gpu memory 
         input_ids = input_ids.to(self.device)
         return self.embed_layer(input_ids).cpu()
