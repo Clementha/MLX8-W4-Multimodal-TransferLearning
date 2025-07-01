@@ -1,0 +1,3 @@
+[submodule ".clement"]
+	path = .clement
+	url = git@github.com:Clementha/vit_captioning.git
