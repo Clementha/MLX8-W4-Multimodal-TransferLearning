@@ -45,6 +45,18 @@ if [[ "$1" == "--split" ]]; then
   return 0
 fi
 
+if [[ "$1" == "--check0" ]]; then
+  echo "Searching for zero-size files in $TARGET_DIR ..."
+  find "$TARGET_DIR" -type f -size 0 | while read -r file; do
+    relpath="${file#$TARGET_DIR/}"
+    dest="../.data/flaticon.com/_corrupt/$relpath"
+    mkdir -p "$(dirname "$dest")"
+    mv "$file" "$dest"
+    echo "$file"
+  done
+  return 0
+fi
+
 case "$1" in
   --png|--svg|--eps|--psd)
     TYPE="${1#--}"
@@ -75,7 +87,7 @@ case "$1" in
     done
     ;;
   *)
-    echo "Usage: $0 --unzip | --split | --png [-y] | --svg [-y] | --eps [-y] | --psd [-y]"
+    echo "Usage: $0 --unzip | --split | --png [-y] | --svg [-y] | --eps [-y] | --psd [-y] | --check0"
     return 1
     ;;
 esac

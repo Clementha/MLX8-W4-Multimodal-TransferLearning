@@ -8,6 +8,22 @@
             "program": "${workspaceFolder}/.charles/qwenvl/traing_pair_gen.py",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}/.charles/qwenvl"
+        },
+        {
+            "name": "Python: ollama_vision.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/.charles/qwenvl/ollama_vision.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/.charles/qwenvl"
+        },
+        {
+            "name": "Python: flaticon_datasets.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/.charles/qwenvl/flaticon_datasets.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/.charles/qwenvl"
         }
     ]
 }
