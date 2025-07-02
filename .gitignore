@@ -203,7 +203,7 @@ wandb
 .ben/uv.lock
 .ben/data/
 .ben/.env
-.ben./ckpts
+.ben/ckpts
 
 
 # unloath cache
