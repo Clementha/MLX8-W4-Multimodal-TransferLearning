@@ -5,74 +5,6 @@ and the norm, projections and feed forward layers.
 """
 
 
-# Decoder class
-# class Decoder(torch.nn.Module):
-#     def __init__(self):
-#         super().__init__()
-    # self.text embeddings # somehow need to pass this to the class
-    # self.image embeddings # somehow need to pass this to the class
-    # self.img_proj_layer = # for projecting image tensor to text tensor shape 
-    # self.proj_out_layer = (in, dim_out = set to vocab size) # for projecting final output to text tensor shape
-    # self.pos_embed = # positional embedding
-    # self.norm = # layer norm
-    # self.mmmha = # masked multi-head attention
-    
-
-    # def forward ():
-        # image_embeds = self.img_proj_layer(image_embeds)  # project to test emebedding shape
-        # x = concat(image_embeds, text embeds) # append img_embed to pos 0.
-        # x = x + pos embed
-        # for block in num_blocks:
-        #   x = masked_mulithead_att(x)
-        # x = self.proj_out_layer(x) # project to vocab size
-        # logits = softmax(x) # although CEL might do this automatically
-        # return logits # (1 logit vector per seq len each with 1 logit per element full vocab)
-    
-# class MaskedMultiHeadAttention(torch.nn.Module):
-#     def __init__(self):
-#         super().__init__()
-    # init
-    # self.num_heads = # set num heads
-    # self.linear_proj = # for projecting down to original shape
-    # self.norm = # normalisation layer
-    # TODO: figure mask out?
-
-    # def forward(x):
-       # x_array = []
-       # for head in num_heads:
-          # x = self_att(x)
-          # x_array.append(x)
-       # x = x_array.proj (project down back to original shape)
-       # x = norm
-       # return x
-
-# class SelfAttention(torch.nn.Module):
-#     def __init__(self):
-#         super().__init__()
-    # init
-    # self.q_w
-    # self.k_w
-    # self.v_w
-    # self.H_W
-
-   # def forward(x):
-     # somehow treat each token one by one and do:
-     # Q = x * self.q_w
-     # K = x * self.k_w
-     # V = x * self.v_w
-     # A = Q @ K
-     # H = A * V
-     # H = H * self.H_W
-     # H = softmax(H/sqrt(len(k))) #check this
-     # return H  # this is the attention output for one token, need to do this for all tokens in the sequence
-
-
-# decoder.py
-
-#TODO: do I need residual connections? Are they here already or now?
-#TODO: got good understanding of DecoderModel, DecoderBlock looks easy, now look at others
-
-from __future__ import annotations #TODO why need this? nto sued?
 import math
 import torch
 from torch import Tensor, nn
@@ -131,7 +63,7 @@ class DecoderModel(nn.Module):
     ) -> Tensor:
         """
         Args:
-            img_feats: (batch, image_dim) pre-computed image vectors
+            img_embed: (batch, image_dim) pre-computed image vectors
             token_embeds: (batch, seq_len, hidden_dim) text embeddings
             attention_mask: (batch, seq_len) bool mask for text tokens
         Returns:
@@ -139,7 +71,7 @@ class DecoderModel(nn.Module):
         """
         B, T, _ = token_embeds.size() # Here B is batch size, T is sequence length, _ is hidden dimension
 
-        # 1) project and prepend image token
+        # 1) project the img_embed to the txt_embed size and prepend this project img_embed
         # First, add an extra dim to go from (B, hidden_dim) to (B, 1, hidden_dim)
         img_token = self.img_proj(img_embed).unsqueeze(1)  # Now (B,1,hidden_dim)
         # Next, concatenate the image token with the text embeddings
@@ -205,10 +137,12 @@ class DecoderBlock(nn.Module):
         """
         # masked self-attention
         attn_out = self.self_attn(x, attention_mask)
+        # residual connection + layer norm
         x = self.norm1(x + attn_out)
 
         # feed-forward, scales up then scales down
         ffn_out = self.ffn(x)
+        # residual connection + layer norm
         return self.norm2(x + ffn_out)
     
 
@@ -243,6 +177,9 @@ class MultiHeadSelfAttention(nn.Module):
         # After concatenating heads, project back to hidden_dim
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
 
+        # Dropout for attention weights
+        self.attn_dropout = nn.Dropout(0.1)
+
     def forward(
         self,
         x: Tensor,
@@ -265,35 +202,39 @@ class MultiHeadSelfAttention(nn.Module):
 
         # 2) reshape into heads: (B, heads, T, head_dim)
         def _split_heads(y: Tensor) -> Tensor:
-            return y.view(B, T, self.num_heads, self.head_dim) \
-                    .permute(0, 2, 1, 3)
+            # y arrives with shape (B, T, hidden_dim), view unpacks to (B, T, num_heads, head_dim)
+            # permute re-arranges from (B, T, heads, head_dim) to (B, heads, T, head_dim)
+            return y.view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3) 
 
-        Qh = _split_heads(Q)
+        # Make individual Q, K and V's for each head 
+        Qh = _split_heads(Q) # (B, T, D) → (B, num_heads, T, head_dim)
         Kh = _split_heads(K)
         Vh = _split_heads(V)
 
-        # 3) scaled dot-product
-        scores = torch.matmul(Qh, Kh.transpose(-2, -1)) \
-                 / math.sqrt(self.head_dim)  # (B, heads, T, T)
+        # 3) scaled dot-product between Q and K
+        # scale outputs to stop gradient explosion by dividing by sqrt(head_dim)
+        scores = torch.matmul(Qh, Kh.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, heads, T, T)
 
-        # causal mask (no attending to future positions)
+        # Build causal mask matrix (no attending to future positions)
         causal = torch.tril(torch.ones((T, T), device=x.device)).bool()
         # pad mask: (B, 1, 1, T)
         pad = attention_mask.view(B, 1, 1, T).bool()
+        # combine causal and pad masks to get full mask
         full_mask = causal.view(1, 1, T, T) & pad
 
         scores = scores.masked_fill(~full_mask, float('-inf'))
         weights = torch.softmax(scores, dim=-1)
+        weights = self.attn_dropout(weights) 
 
         # 4) weighted sum
         context = torch.matmul(weights, Vh)  # (B, heads, T, head_dim)
 
-        # 5) combine heads
+        # 5) Unzip the results from each head and concatenate them
         context = (
-            context.permute(0, 2, 1, 3)
-                   .contiguous()
-                   .view(B, T, self.num_heads * self.head_dim)
-        )  # back to (B, T, hidden_dim)
+            context.permute(0, 2, 1, 3) # swap to go from(batch, heads, tokens, per_head_dim) → (batch, tokens, heads, per_head_dim)
+                   .contiguous() # some memeory magic thing
+                   .view(B, T, self.num_heads * self.head_dim) # flattens to (B, T, hidden_dim)
+        )
 
         # 6) final linear
         return self.out_proj(context)
@@ -337,17 +278,76 @@ class FeedForward(nn.Module):
 
 
 
-
-
-
-
-
 if __name__ == "__main__":
     # smoke test
     B, L, D_img, D_txt, V = 2, 5, 768, 1024, 30522
-    dec = Decoder(D_img, D_txt, 8, 6, V, L)
+    dec = DecoderModel(D_img, D_txt, 8, 6, V, L)
     fake_img = torch.randn(B, D_img)
     fake_txt = torch.randn(B, L, D_txt)
     fake_mask = torch.ones(B, L, dtype=torch.bool)
     out = dec(fake_img, fake_txt, fake_mask)
     print("output shape:", out.shape)  # → (2,5,30522)
+
+
+
+# Decoder class
+# class Decoder(torch.nn.Module):
+#     def __init__(self):
+#         super().__init__()
+    # self.text embeddings # somehow need to pass this to the class
+    # self.image embeddings # somehow need to pass this to the class
+    # self.img_proj_layer = # for projecting image tensor to text tensor shape 
+    # self.proj_out_layer = (in, dim_out = set to vocab size) # for projecting final output to text tensor shape
+    # self.pos_embed = # positional embedding
+    # self.norm = # layer norm
+    # self.mmmha = # masked multi-head attention
+    
+
+    # def forward ():
+        # image_embeds = self.img_proj_layer(image_embeds)  # project to test emebedding shape
+        # x = concat(image_embeds, text embeds) # append img_embed to pos 0.
+        # x = x + pos embed
+        # for block in num_blocks:
+        #   x = masked_mulithead_att(x)
+        # x = self.proj_out_layer(x) # project to vocab size
+        # logits = softmax(x) # although CEL might do this automatically
+        # return logits # (1 logit vector per seq len each with 1 logit per element full vocab)
+    
+# class MaskedMultiHeadAttention(torch.nn.Module):
+#     def __init__(self):
+#         super().__init__()
+    # init
+    # self.num_heads = # set num heads
+    # self.linear_proj = # for projecting down to original shape
+    # self.norm = # normalisation layer
+    # TODO: figure mask out?
+
+    # def forward(x):
+       # x_array = []
+       # for head in num_heads:
+          # x = self_att(x)
+          # x_array.append(x)
+       # x = x_array.proj (project down back to original shape)
+       # x = norm
+       # return x
+
+# class SelfAttention(torch.nn.Module):
+#     def __init__(self):
+#         super().__init__()
+    # init
+    # self.q_w
+    # self.k_w
+    # self.v_w
+    # self.H_W
+
+   # def forward(x):
+     # somehow treat each token one by one and do:
+     # Q = x * self.q_w
+     # K = x * self.k_w
+     # V = x * self.v_w
+     # A = Q @ K
+     # H = A * V
+     # H = H * self.H_W
+     # H = softmax(H/sqrt(len(k))) #check this
+     # return H  # this is the attention output for one token, need to do this for all tokens in the sequence
+
