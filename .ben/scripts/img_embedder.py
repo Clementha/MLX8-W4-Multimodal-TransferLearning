@@ -1,63 +1,67 @@
-
 # scripts/img_embedder.py
 """
 Module for computing image embeddings using Hugging Face vision models.
+Supports both CLIP (vision‐only) and ViT.
 """
 import torch
 from torch import Tensor
 from typing import List
-from transformers import AutoFeatureExtractor, AutoModel
 from PIL import Image
-
+from transformers import (
+  CLIPImageProcessor,
+  CLIPVisionModelWithProjection,
+  ViTImageProcessor,
+  ViTModel,
+)
 
 class ImgEmbedder:
+  """
+  Wraps a HF vision model to produce a (B, D_img) embedding tensor.
+  """
+  def __init__(
+    self,
+    model_name: str,
+    choice: str = "CLIP"
+  ) -> None:
     """
-    Wraps a Hugging Face vision model and feature extractor to compute embeddings.
+    Args:
+      model_name: HF repo name (e.g. "openai/clip-vit-base-patch32" or "google/vit-base-patch16-224-in21k").
+      choice:     "CLIP" or "ViT".
     """
-    def __init__(
-        self,
-        model_name: str,
-        device: torch.device = None
-    ) -> None:
-        """
-        Initialize the embedder.
+    self.choice = choice.upper()
+    self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[ImgEmbedder] loading {self.choice} vision model on {self.device}")
 
-        Args:
-            model_name: HF model identifier.
-            device: torch.device (defaults to GPU if available).
-        """
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {self.device}")
+    if self.choice == "CLIP":
+      # vision‐only CLIP (with projection head)
+      self.processor = CLIPImageProcessor.from_pretrained(model_name)
+      self.model     = CLIPVisionModelWithProjection.from_pretrained(model_name)
+    else:
+      # standard ViT
+      self.processor = ViTImageProcessor.from_pretrained(model_name)
+      self.model     = ViTModel.from_pretrained(model_name)
 
-        # Load feature extractor which will rescale/crop images to fit the input shape
-        self.extractor = AutoFeatureExtractor.from_pretrained(model_name)
-        
-        # Load the actual model
-        self.model = AutoModel.from_pretrained(model_name).to(self.device)
+    self.model.to(self.device).eval()
+    # Freeze weights
+    for p in self.model.parameters():
+      p.requires_grad_(False)
 
-        total_params = sum(p.numel() for p in self.model.parameters())
-        model_mb = total_params * 4 / (1024 ** 2)
-        print(f"Loaded model '{model_name}' with {total_params:,} params ({model_mb:.2f} MB)")
+  def embed_batch(self, images: List[Image.Image]) -> Tensor:
+    """
+    Preprocess a batch of PIL images and return embeddings.
+    """
+    # 1) preprocess
+    inputs = self.processor(images=images, return_tensors="pt").to(self.device)
 
-        # Freeze model by putting it in evaluation mode
-        self.model.eval()               # disable dropout, batchnorm & co.
-        for p in self.model.parameters():
-            p.requires_grad_(False)     # turn off gradient tracking
+    with torch.no_grad():
+      if self.choice == "CLIP":
+        # CLIPVisionModelWithProjection.forward returns .image_embeds
+        raw    = self.model(**inputs)
+        embeds = raw.image_embeds     # shape (B, projection_dim)
+      else:
+        # ViTModel returns pooler_output
+        raw    = self.model(**inputs)
+        embeds = raw.pooler_output    # shape (B, hidden_size)
 
-    def embed_batch(self, images: List[Image.Image]) -> Tensor:
-        """
-        Compute embeddings for a batch of PIL images.
-
-        Returns:
-            Tensor of shape (batch_size, hidden_size).
-        """
-        inputs = self.extractor(images=images, return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-
-        # Return the CLS token embeddings only. CLS token is the first token in the sequence, so we take [:, 0, :]
-        # This is a common practice to get a fixed-size representation of the input image
-        return outputs.last_hidden_state[:, 0, :].cpu()
+    return embeds.cpu()
 

@@ -30,13 +30,17 @@ NUM_HEADS    = 8
 NUM_LAYERS   = 6
 VAL_SPLIT    = 0.15
 
-
-VISION_MODEL = "google/vit-base-patch16-224-in21k"
+VISION_MODEL_CHOICE = "CLIP"  # "CLIP", "ViT", or any other vision model
 TEXT_MODEL   = "Qwen/Qwen3-Embedding-0.6B"
 
 BASE_DIR     = os.path.dirname(__file__)
 METADATA     = os.path.join(BASE_DIR, "..", "data", "flickr30k", "metadata.parquet")
 IMAGEDIR     = os.path.join(BASE_DIR, "..", "data", "flickr30k", "images")
+
+if VISION_MODEL_CHOICE == "CLIP":
+    VISION_MODEL = "openai/clip-vit-base-patch32"  # default CLIP model
+if VISION_MODEL_CHOICE == "ViT":
+    VISION_MODEL = "google/vit-base-patch16-224-in21k"  # default ViT model
 # ================
 
 def main():
@@ -77,7 +81,7 @@ def main():
 
     # Define our models
     text_embedder = TextEmbedder(TEXT_MODEL)
-    img_embedder  = ImgEmbedder(VISION_MODEL)
+    img_embedder  = ImgEmbedder(VISION_MODEL, choice=VISION_MODEL_CHOICE) ###
 
     # Set up train adn validation DataLoaders
     train_loader = DataLoader(
@@ -109,10 +113,16 @@ def main():
 
     # 2) Device & (future) decoder + optimizer
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # Instantiate the decoder model, get embeddings dims first
+    # Get embeddings dims to set up the decoder model with
     txt_hidden_dims = text_embedder.embed_layer.embedding_dim   # e.g. 1024
     vocab_size = text_embedder.tokenizer.vocab_size        # e.g. 151669 tokens
-    img_dim = img_embedder.model.config.hidden_size # e.g. 768 for ViT base
+    #img_dim = img_embedder.model.config.hidden_size # e.g. 768 for ViT base
+    # Pick up the image embedding size from the HF config:
+    vision_cfg = img_embedder.model.config
+    img_dim: int = getattr(vision_cfg, "projection_dim",
+                           getattr(vision_cfg, "hidden_size", None))
+    if img_dim is None:
+        raise ValueError("Couldn't find projection_dim or hidden_size in vision config")
 
     # Create the decoder model with the image and text embedding dimensions
     model = DecoderModel(

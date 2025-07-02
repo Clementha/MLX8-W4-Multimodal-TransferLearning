@@ -1,0 +1,7 @@
+ckpt_20250702_134623_epoch01_acc0.9860: 
+Epoch 01 » train_loss 0.4924, train_acc 0.9590, val_loss 0.1688,   val_acc 0.9860, lr 1.00e-04
+https://wandb.ai/ben075342-ucl/flickr30k-captioning/runs/narp1f2p?nw=nwuserben075342
+
+The 2 epoch run with fixed validation:
+ckpt_20250702_161219_epoch02_acc0.3523
+https://wandb.ai/ben075342-ucl/flickr30k-captioning/runs/mo0z5xnb?nw=nwuserben075342
