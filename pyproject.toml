@@ -33,6 +33,8 @@ dependencies = [
     "pytest>=8.4.1",
     "requests>=2.32.4",
     "unsloth>=2025.6.12",
+    "torchmetrics>=1.7.3",
+    "colorlog>=6.9.0",
 ]
 
 #   "unsloth[cu121-ampere-torch230]",

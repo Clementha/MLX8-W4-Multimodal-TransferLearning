@@ -71,3 +71,6 @@ echo "Setup complete!"
 nvcc --version
 nvidia-smi
 python -c "import torch; print('PyTorch version:', torch.__version__); print('CUDA available:', torch.cuda.is_available()); print('CUDA device count:', torch.cuda.device_count()); print('CUDA device name:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'None')" || echo "PyTorch not installed"
+
+git config --global user.email "charles.cai@socialogix.net"
+git config --global user.name "Charles Cai"
