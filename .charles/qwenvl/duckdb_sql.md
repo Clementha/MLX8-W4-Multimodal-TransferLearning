@@ -15,6 +15,8 @@ ATTACH '../.data/flaticon_vision_text.sqlite3' AS sqlite_db (TYPE sqlite);
 ```sql
 SELECT * from sqlite_db.flaticon_images LIMIT 10;
 
+SELECT text,collection from sqlite_db.flaticon_images LIMIT 10;
+
 DESCRIBE sqlite_db.flaticon_images;
 -- ┌──────────────┬─────────────┬─────────┬─────────┬─────────┬─────────┐
 -- │ column_name  │ column_type │  null   │   key   │ default │  extra  │

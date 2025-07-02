@@ -6,10 +6,17 @@ import pytest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+MODEL_NAME = "Qwen/Qwen3-0.6B-Base" 
+#MODEL_NAME = "Qwen/Qwen3-0.6B"
+#MODEL_NAME = "Qwen/Qwen3-1.7B-Base"
+#MODEL_NAME = "Qwen/Qwen3-4B-Base"
+
+MODEL_DIR = "../.data/hf/models/"
+
+
+
 def test_qwen3_base_model():
     """Test that Qwen3 base model can generate text."""
-    MODEL_NAME = "Qwen/Qwen3-0.6B-Base" #"Qwen/Qwen3-0.6B" none base model seems to be slightly better, but still very low quality
-    MODEL_DIR = "../.data/hf/models/"
     model_path = os.path.join(MODEL_DIR, MODEL_NAME)
     
     # Skip test if model not available
@@ -37,11 +44,11 @@ def test_qwen3_base_model():
         #     trust_remote_code=True  # May be needed for Qwen models
         # )
 
-        prompt = "Why sky is blue?" # "In one sentence, what is the capital of France?" # hello, who are you?" #
+        prompt = "Why the sky is blue?" # "In one sentence, what is the capital of France?" # hello, who are you?" #
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
         
         with torch.no_grad():
-            out_ids = model.generate(**inputs, max_new_tokens=20)
+            out_ids = model.generate(**inputs, max_new_tokens=2048)
             result = tokenizer.decode(out_ids[0], skip_special_tokens=True)
             
         #assert len(result) > len(prompt)

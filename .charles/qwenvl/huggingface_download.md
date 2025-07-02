@@ -14,7 +14,10 @@ git clone https://huggingface.co/openai/clip-vit-base-patch32           ../.data
 
 
 # QWen3-0.6B-Base
+git clone https://huggingface.co/Qwen/Qwen3-0.6B                   ../.data/hf/models/Qwen/Qwen3-0.6B
 git clone https://huggingface.co/Qwen/Qwen3-0.6B-Base                   ../.data/hf/models/Qwen/Qwen3-0.6B-Base
+git clone https://huggingface.co/Qwen/Qwen3-1.7B-Base                   ../.data/hf/models/Qwen/Qwen3-1.7B-Base
+git clone https://huggingface.co/Qwen/Qwen3-4B-Base                   ../.data/hf/models/Qwen/Qwen3-4B-Base
 
 uv run test_qwen3_base.py
 

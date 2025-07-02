@@ -202,3 +202,7 @@ wandb
 .ben/pytorch_uv/
 .ben/uv.lock
 .ben/data/
+
+
+# unloath cache
+unsloth_compiled_cache/
