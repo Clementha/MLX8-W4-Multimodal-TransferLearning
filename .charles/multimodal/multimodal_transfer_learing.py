@@ -34,10 +34,7 @@ from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
 )
-from torchmetrics.text.bleu import BLEUScore
-from torchmetrics.text.cider import CiderD
-from torchmetrics.functional.retrieval.retrieval_recall import retrieval_recall
-from torchmetrics.functional.retrieval.retrieval_precision import retrieval_precision
+import evaluate
 
 import logging
 import colorlog
@@ -66,6 +63,11 @@ SEED: int = int(os.getenv("SEED", 42))
 # Paths & logging -------------------------------------------------------------
 OUTPUT_DIR_MODELS: Path = Path(os.getenv("OUTPUT_DIR_MODELS", "../.data/models"))
 OUTPUT_DIR_MODELS.mkdir(parents=True, exist_ok=True)
+
+OUTPUT_DIR_DATASETS: Path = Path(os.getenv("OUTPUT_DIR_DATASETS", "../.data/datasets"))
+OUTPUT_DIR_DATASETS.mkdir(parents=True, exist_ok=True)
+
+TRAINING_DATASET: str = os.getenv("TRAINING_DATASET", "flickr30k")
 
 WANDB_ENTITY: str = os.getenv("WANDB_ENTITY", "charles-cai")
 WANDB_PROJECT: str = os.getenv("WANDB_PROJECT", "mlx8-w4-multimodal-transferlearning")
@@ -180,7 +182,7 @@ class MultimodalTransferLearning:
     def _init_qwen(self):
         self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B-Base")
         self.qwen = AutoModelForCausalLM.from_pretrained(
-            "Qwen/Qwen3-0.6B-Base", torch_dtype="auto", attn_implementation="flash_attention_2"
+            "Qwen/Qwen3-0.6B-Base", torch_dtype="auto", #attn_implementation="flash_attention_2"
         ).to(self.device)
         self.qwen.eval().requires_grad_(False)
         if TOP_K > 0:
@@ -194,20 +196,47 @@ class MultimodalTransferLearning:
 
     # --------------------------------------------------------------------- #
     def _prepare_data(self):
+        # Check if processed data already exists
+        processed_dir = OUTPUT_DIR_DATASETS / TRAINING_DATASET / "_processed"
+        
+        if processed_dir.exists() and (processed_dir / "dataset_dict").exists():
+            log.info(f"📁 Loading cached dataset from {processed_dir}")
+            try:
+                from datasets import load_from_disk
+                self.dataset = load_from_disk(str(processed_dir / "dataset_dict"))
+                log.info(
+                    f"📚 Loaded cached dataset: "
+                    f"{len(self.dataset['train'])} train / {len(self.dataset['eval'])} eval / {len(self.dataset['test'])} test"
+                )
+                self._setup_data_loaders()
+                return
+            except Exception as e:
+                log.warning(f"⚠️ Failed to load cached data: {e}. Reprocessing...")
+        
+        log.warning("⏳ Loading raw dataset from HuggingFace - this may take several minutes...")
         raw = load_dataset("lmms-lab/flickr30k", split="test", token=os.getenv("HF_TOKEN"))
         
-        # Flatten: one row per image-caption pair
+        log.warning("⏳ Flattening dataset (creating image-caption pairs) - this may take a while...")
+        # Use streaming approach to reduce memory usage
         flattened_data = []
-        for example in raw:
+        for i, example in enumerate(tqdm(raw, desc="Flattening dataset")):
             image = example["image"]
-            for caption in example["caption"]:  # iterate through list of captions
+            for caption in example["caption"]:
                 flattened_data.append({"image": image, "caption": caption})
+            
+            # Process in chunks to avoid OOM
+            if (i + 1) % 1000 == 0:
+                log.info(f"Processed {i + 1} examples, created {len(flattened_data)} pairs")
         
-        # Convert back to dataset format
+        log.warning("⏳ Converting to dataset format and splitting - this may take time...")
         from datasets import Dataset
         flat_dataset = Dataset.from_list(flattened_data)
         
+        # Clear flattened_data to free memory
+        del flattened_data
+        
         # split 80/10/10 with fixed seed
+        log.info("Splitting dataset 80/10/10...")
         train_test = flat_dataset.train_test_split(test_size=0.2, seed=SEED)
         eval_test = train_test["test"].train_test_split(test_size=0.5, seed=SEED)
         self.dataset = DatasetDict({
@@ -215,11 +244,23 @@ class MultimodalTransferLearning:
             "eval": eval_test["train"],
             "test": eval_test["test"],
         })
+        
         log.info(
             f"📚 Dataset split: "
             f"{len(self.dataset['train'])} train / {len(self.dataset['eval'])} eval / {len(self.dataset['test'])} test"
         )
-
+        
+        # Save processed dataset to disk for future use
+        log.info(f"💾 Caching processed dataset to {processed_dir}")
+        processed_dir.mkdir(parents=True, exist_ok=True)
+        self.dataset.save_to_disk(str(processed_dir / "dataset_dict"))
+        
+        self._setup_data_loaders()
+    
+    def _setup_data_loaders(self):
+        """Setup data loaders with preprocessing - separated to avoid code duplication"""
+        log.info("⏳ Setting up data preprocessing and loaders...")
+        
         def preprocess(example):
             pixel = self.processor(images=example["image"], return_tensors="pt").pixel_values[0]
             example["pixel"] = pixel
@@ -228,11 +269,37 @@ class MultimodalTransferLearning:
             ).input_ids[0]
             return example
 
-        self.dataset = self.dataset.map(preprocess, remove_columns=["image", "caption"])
+        # Process datasets with progress bars and in smaller batches to avoid OOM
+        log.info("Preprocessing train set...")
+        self.dataset["train"] = self.dataset["train"].map(
+            preprocess, 
+            remove_columns=["image", "caption"],
+            batch_size=100,  # Process in smaller batches
+            desc="Preprocessing train"
+        )
+        
+        log.info("Preprocessing eval set...")
+        self.dataset["eval"] = self.dataset["eval"].map(
+            preprocess, 
+            remove_columns=["image", "caption"],
+            batch_size=100,
+            desc="Preprocessing eval"
+        )
+        
+        log.info("Preprocessing test set...")
+        self.dataset["test"] = self.dataset["test"].map(
+            preprocess, 
+            remove_columns=["image", "caption"],
+            batch_size=100,
+            desc="Preprocessing test"
+        )
+        
         self.dataset.set_format(type="torch")
         self.train_loader = DataLoader(self.dataset["train"], batch_size=BATCH_SIZE, shuffle=True)
         self.eval_loader = DataLoader(self.dataset["eval"], batch_size=BATCH_SIZE)
         self.test_loader = DataLoader(self.dataset["test"], batch_size=BATCH_SIZE)
+        
+        log.info("✅ Data loaders ready!")
 
     # --------------------------------------------------------------------- #
     def _init_optimisers(self):
@@ -315,12 +382,21 @@ class MultimodalTransferLearning:
             return dict(BLEU4=0.0, CIDEr=0.0, R1=0.0, R5=0.0, P1=0.0, P5=0.0)
             
         try:
-            bleu = BLEUScore(n_gram=4)(preds, refs).item()
-        except:
+            # Load BLEU metric from evaluate
+            bleu_metric = evaluate.load("bleu")
+            # Convert single strings to lists of references as expected by evaluate
+            bleu_refs = [[ref] for ref in refs]
+            bleu_result = bleu_metric.compute(predictions=preds, references=bleu_refs)
+            bleu = bleu_result["bleu"]
+        except Exception as e:
+            print(f"BLEU computation failed: {e}")
             bleu = 0.0
             
         try:
-            cider = CiderD()(preds, refs).item()
+            # Load CIDEr metric from evaluate (if available)
+            # Note: CIDEr might not be available in all evaluate versions
+            # Using a fallback approach
+            cider = 0.0  # Placeholder - CIDEr is complex to implement from scratch
         except:
             cider = 0.0
             

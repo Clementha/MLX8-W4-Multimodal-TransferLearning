@@ -38,7 +38,8 @@
             "request": "launch",
             "program": "${workspaceFolder}/.charles/multimodal/multimodal_transfer_learing.py",
             "console": "integratedTerminal",
-            "cwd": "${workspaceFolder}/.charles/multimodal"
+            "cwd": "${workspaceFolder}/.charles/multimodal",
+            "args": ["--train"]
         }
     ]
 }
