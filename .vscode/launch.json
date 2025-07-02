@@ -32,6 +32,15 @@
             "program": "${workspaceFolder}/.charles/qwenvl/test_openai_clip.py",
             "console": "integratedTerminal"
         },
+         {
+            "name": "Python: multimodal_transfer_learing.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/.charles/multimodal/multimodal_transfer_learing.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/.charles/multimodal",
+            "args": ["--data"]
+        },
         {
             "name": "Python: multimodal_transfer_learing.py",
             "type": "debugpy",
@@ -40,6 +49,15 @@
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}/.charles/multimodal",
             "args": ["--train"]
+        },
+        {
+            "name": "Python: multimodal_transfer_learing.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/.charles/multimodal/multimodal_transfer_learing.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/.charles/multimodal",
+            "args": ["--test"]
         }
     ]
 }

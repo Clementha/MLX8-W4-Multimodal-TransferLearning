@@ -25,7 +25,7 @@ from tqdm.auto import tqdm
 
 import wandb
 from dotenv import load_dotenv
-from datasets import load_dataset, DatasetDict
+from datasets import load_dataset, DatasetDict, Dataset
 from transformers import (
     ViTModel, #AutoModel,
     ViTImageProcessorFast,  #AutoImageProcessor,
@@ -120,15 +120,20 @@ class ImageAdapter(nn.Module):
 ###############################################################################
 
 class MultimodalTransferLearning:
-    def __init__(self):
+    def __init__(self, prepare_data_only=False):
         self._set_seed(SEED)
-        self._init_wandb()
+        if not prepare_data_only:
+            self._init_wandb()
         self._init_vision()
-        self._init_qwen()
-        self.bridge = ImageAdapter(IMG_EMB_DIM).to(self.device)
+        if not prepare_data_only:
+            self._init_qwen()
+            self.bridge = ImageAdapter(IMG_EMB_DIM).to(self.device)
         self._prepare_data()
-        self._init_optimisers()
-        log.info("🚀 Initialisation complete. Starting training…")
+        if not prepare_data_only:
+            self._init_optimisers()
+            log.info("🚀 Initialisation complete. Starting training…")
+        else:
+            log.info("🚀 Data preparation complete.")
 
     # --------------------------------------------------------------------- #
     def _set_seed(self, seed: int):
@@ -196,18 +201,22 @@ class MultimodalTransferLearning:
 
     # --------------------------------------------------------------------- #
     def _prepare_data(self):
-        # Check if processed data already exists
+        # Check if fully processed data already exists
         processed_dir = OUTPUT_DIR_DATASETS / TRAINING_DATASET / "_processed"
+        dataset_path = processed_dir / "dataset_dict"
+        images_cache_path = processed_dir / "images_cache.pt"
         
-        if processed_dir.exists() and (processed_dir / "dataset_dict").exists():
-            log.info(f"📁 Loading cached dataset from {processed_dir}")
+        if (dataset_path.exists() and images_cache_path.exists()):
+            log.info(f"📁 Loading cached dataset and images from {processed_dir}")
             try:
                 from datasets import load_from_disk
-                self.dataset = load_from_disk(str(processed_dir / "dataset_dict"))
+                self.dataset = load_from_disk(str(dataset_path))
+                self.images_cache = torch.load(images_cache_path, map_location='cpu')
                 log.info(
                     f"📚 Loaded cached dataset: "
                     f"{len(self.dataset['train'])} train / {len(self.dataset['eval'])} eval / {len(self.dataset['test'])} test"
                 )
+                log.info(f"🖼️ Loaded {len(self.images_cache)} cached processed images")
                 self._setup_data_loaders()
                 return
             except Exception as e:
@@ -216,24 +225,18 @@ class MultimodalTransferLearning:
         log.warning("⏳ Loading raw dataset from HuggingFace - this may take several minutes...")
         raw = load_dataset("lmms-lab/flickr30k", split="test", token=os.getenv("HF_TOKEN"))
         
-        log.warning("⏳ Flattening dataset (creating image-caption pairs) - this may take a while...")
-        # Use streaming approach to reduce memory usage
-        flattened_data = []
-        for i, example in enumerate(tqdm(raw, desc="Flattening dataset")):
-            image = example["image"]
-            for caption in example["caption"]:
-                flattened_data.append({"image": image, "caption": caption})
-            
-            # Process in chunks to avoid OOM
-            if (i + 1) % 1000 == 0:
-                log.info(f"Processed {i + 1} examples, created {len(flattened_data)} pairs")
+        # First, process all unique images and cache them
+        log.warning("⏳ Processing unique images - this may take time...")
+        self._process_and_cache_images(raw, processed_dir)
         
-        log.warning("⏳ Converting to dataset format and splitting - this may take time...")
-        from datasets import Dataset
-        flat_dataset = Dataset.from_list(flattened_data)
-        
-        # Clear flattened_data to free memory
-        del flattened_data
+        log.warning("⏳ Flattening dataset (creating image-caption pairs)...")
+        def flatten_generator():
+            for i, example in enumerate(tqdm(raw, desc="Flattening dataset")):
+                # Use image index as key instead of storing image data
+                for caption in example["caption"]:
+                    yield {"image_idx": i, "caption": caption}
+
+        flat_dataset = Dataset.from_generator(flatten_generator)
         
         # split 80/10/10 with fixed seed
         log.info("Splitting dataset 80/10/10...")
@@ -253,45 +256,140 @@ class MultimodalTransferLearning:
         # Save processed dataset to disk for future use
         log.info(f"💾 Caching processed dataset to {processed_dir}")
         processed_dir.mkdir(parents=True, exist_ok=True)
-        self.dataset.save_to_disk(str(processed_dir / "dataset_dict"))
+        self.dataset.save_to_disk(str(dataset_path))
         
         self._setup_data_loaders()
+    
+    def _process_and_cache_images(self, raw_dataset, processed_dir):
+        """Process all unique images once and cache the results"""
+        processed_dir.mkdir(parents=True, exist_ok=True)
+        images_cache_path = processed_dir / "images_cache.pt"
+        
+        # Check if images are already cached
+        if images_cache_path.exists():
+            try:
+                self.images_cache = torch.load(images_cache_path, map_location='cpu')
+                expected_count = len(raw_dataset)
+                if len(self.images_cache) == expected_count:
+                    log.info(f"🖼️ Using existing cached images ({len(self.images_cache)} images)")
+                    return
+                else:
+                    log.warning(f"⚠️ Cached images count mismatch. Expected {expected_count}, got {len(self.images_cache)}. Reprocessing...")
+            except Exception as e:
+                log.warning(f"⚠️ Failed to load cached images: {e}. Reprocessing...")
+        
+        log.info("🔄 Processing and caching images...")
+        self.images_cache = {}
+        
+        # Move processor to GPU if possible and supported
+        processor_device = self.device if self._can_use_gpu_for_processing() else "cpu"
+        if processor_device == "cuda":
+            log.info("🚀 Using GPU acceleration for image processing")
+        
+        # Process images in batches to optimize GPU usage
+        batch_size = 32 if processor_device == "cuda" else 8
+        
+        for i in tqdm(range(0, len(raw_dataset), batch_size), desc="Processing image batches"):
+            batch_end = min(i + batch_size, len(raw_dataset))
+            batch_images = [raw_dataset[j]["image"] for j in range(i, batch_end)]
+            
+            try:
+                if VISION_ENCODER == "vit":
+                    batch_pixels = self.processor(images=batch_images, return_tensors="pt").pixel_values
+                else:
+                    batch_pixels = self.processor(images=batch_images, return_tensors="pt").pixel_values
+                
+                # Move to specified device
+                if processor_device == "cuda":
+                    batch_pixels = batch_pixels.to(self.device)
+                
+                # Store each processed image
+                for j, pixel_tensor in enumerate(batch_pixels):
+                    self.images_cache[i + j] = pixel_tensor.cpu()  # Always store on CPU to save GPU memory
+                    
+            except Exception as e:
+                log.warning(f"⚠️ Batch processing failed at batch {i}, falling back to individual processing: {e}")
+                # Fallback to individual processing
+                for j in range(i, batch_end):
+                    try:
+                        image = raw_dataset[j]["image"]
+                        if VISION_ENCODER == "vit":
+                            pixel = self.processor(images=image, return_tensors="pt").pixel_values[0]
+                        else:
+                            pixel = self.processor(images=image, return_tensors="pt").pixel_values[0]
+                        self.images_cache[j] = pixel.cpu()
+                    except Exception as e2:
+                        log.error(f"❌ Failed to process image {j}: {e2}")
+                        # Create a dummy tensor as fallback
+                        dummy_size = (3, 224, 224)  # Standard size
+                        self.images_cache[j] = torch.zeros(dummy_size)
+        
+        log.info(f"💾 Saving {len(self.images_cache)} processed images to cache")
+        torch.save(self.images_cache, images_cache_path)
+        log.info(f"✅ Images cached to {images_cache_path}")
+    
+    def _can_use_gpu_for_processing(self):
+        """Check if GPU can be used for image processing"""
+        if not torch.cuda.is_available():
+            return False
+        
+        # Test if processor can work with CUDA tensors
+        try:
+            # Create a small test image
+            import PIL.Image
+            import numpy as np
+            test_img = PIL.Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
+            
+            if VISION_ENCODER == "vit":
+                test_result = self.processor(images=test_img, return_tensors="pt").pixel_values
+            else:
+                test_result = self.processor(images=test_img, return_tensors="pt").pixel_values
+            
+            # Try moving to GPU
+            test_result.to(self.device)
+            return True
+        except Exception:
+            return False
     
     def _setup_data_loaders(self):
         """Setup data loaders with preprocessing - separated to avoid code duplication"""
         log.info("⏳ Setting up data preprocessing and loaders...")
         
         def preprocess(example):
-            pixel = self.processor(images=example["image"], return_tensors="pt").pixel_values[0]
+            # Get preprocessed image from cache using image_idx
+            image_idx = example["image_idx"]
+            pixel = self.images_cache[image_idx]
             example["pixel"] = pixel
+            
+            # Tokenize caption
             example["input_ids"] = self.tokenizer(
                 example["caption"], truncation=True, return_tensors="pt"
             ).input_ids[0]
             return example
 
-        # Process datasets with progress bars and in smaller batches to avoid OOM
-        log.info("Preprocessing train set...")
+        # Process datasets - now much faster since images are pre-processed
+        log.info("Setting up train set...")
         self.dataset["train"] = self.dataset["train"].map(
             preprocess, 
-            remove_columns=["image", "caption"],
-            batch_size=100,  # Process in smaller batches
-            desc="Preprocessing train"
+            remove_columns=["image_idx", "caption"],
+            batch_size=1000,  # Can use larger batches now
+            desc="Setting up train"
         )
         
-        log.info("Preprocessing eval set...")
+        log.info("Setting up eval set...")
         self.dataset["eval"] = self.dataset["eval"].map(
             preprocess, 
-            remove_columns=["image", "caption"],
-            batch_size=100,
-            desc="Preprocessing eval"
+            remove_columns=["image_idx", "caption"],
+            batch_size=1000,
+            desc="Setting up eval"
         )
         
-        log.info("Preprocessing test set...")
+        log.info("Setting up test set...")
         self.dataset["test"] = self.dataset["test"].map(
             preprocess, 
-            remove_columns=["image", "caption"],
-            batch_size=100,
-            desc="Preprocessing test"
+            remove_columns=["image_idx", "caption"],
+            batch_size=1000,
+            desc="Setting up test"
         )
         
         self.dataset.set_format(type="torch")
@@ -483,18 +581,25 @@ def parse_args():
     p = argparse.ArgumentParser(description="Multimodal Transfer‑Learning runner")
     p.add_argument("--train", action="store_true", help="Train then evaluate")
     p.add_argument("--test", action="store_true", help="Run standalone test using last checkpoint")
+    p.add_argument("--data", action="store_true", help="Prepare and cache dataset only")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    engine = MultimodalTransferLearning()
-    if args.train:
+    
+    if args.data:
+        log.info("🔄 Preparing dataset...")
+        engine = MultimodalTransferLearning(prepare_data_only=True)
+        log.info("✅ Dataset preparation complete!")
+    elif args.train:
+        engine = MultimodalTransferLearning()
         engine.train()
     elif args.test:
+        engine = MultimodalTransferLearning()
         engine._evaluate(epoch=EPOCHS, test=True)
     else:
-        log.error("❌ Must specify either --train or --test")
+        log.error("❌ Must specify either --data, --train, or --test")
 
 
 if __name__ == "__main__":
