@@ -11,6 +11,9 @@ from torch.utils.data import DataLoader, random_split
 import wandb
 from dotenv import load_dotenv
 
+from sklearn.model_selection import GroupShuffleSplit
+from torch.utils.data import Subset
+
 from dataset       import Flickr30kDataset
 from img_embedder  import ImgEmbedder
 from text_embedder import TextEmbedder
@@ -64,10 +67,14 @@ def main():
     # 1) Dataset & DataLoader
     # Set up train and val datasets
     full_ds = Flickr30kDataset(METADATA, IMAGEDIR)
-    n_val = int(len(full_ds) * VAL_SPLIT)
-    n_train = len(full_ds) - n_val
-    train_ds, val_ds = random_split(full_ds, [n_train, n_val])
-    
+
+    # Split into train and validation sets, this will split by filename
+    groups = full_ds.df["filename"] # group images by files
+    gss = GroupShuffleSplit(n_splits=1, test_size=VAL_SPLIT, random_state=42)
+    train_idx, val_idx = next(gss.split(full_ds.df, groups=groups))
+    train_ds = Subset(full_ds, train_idx)
+    val_ds   = Subset(full_ds, val_idx)
+
     # Define our models
     text_embedder = TextEmbedder(TEXT_MODEL)
     img_embedder  = ImgEmbedder(VISION_MODEL)
@@ -164,10 +171,15 @@ def main():
             # 3b) Forward pass through decoder, compute loss
             logits = model(img_embeddings, txt_embeddings, attention_mask) # outputs (B, T, V)
 
-            # 3c) flatten outputs for los function
+            # 3c) shift everything for next‐token prediction:
+            #    – drop the last logit (we don’t predict “nothing”)
+            #    – drop the first token in targets (we want to predict token t+1)
             B, T, V = logits.shape
-            flat_logits = logits.reshape(B * T, V)             # (B*T, V)
-            targets = input_ids.to(device).view(B * T)  # (B*T,)
+
+            # only keep positions 0…T-2 in the logits,
+            # and targets positions 1…T-1
+            flat_logits = logits[:, :-1, :].reshape(B * (T - 1), V)     # (B*(T-1), V)
+            targets     = input_ids[:, 1:].to(device).reshape(B * (T - 1))  # (B*(T-1),)
 
             # 3d) loss + backpropagation
             loss = loss_fn(flat_logits, targets)
@@ -175,11 +187,20 @@ def main():
             loss.backward()
             optimizer.step()
 
-            # 3e) Update metrics
-            # token-level accuracy
-            preds    = logits.argmax(-1)            # (B, T)
-            correct  = ((preds == input_ids) & (input_ids != pad_id)).sum().item()
-            total    = (input_ids != pad_id).sum().item()
+            # 3e) Update metrics (next-token accuracy)
+            # drop last logit, drop first input to align predictions→next token
+            train_shifted_preds = logits[:, :-1, :].argmax(-1)      # (B, T-1)
+            train_shifted_targs = input_ids[:, 1:]                  # (B, T-1)
+            train_mask          = train_shifted_targs != pad_id     # ignore pads
+
+            correct = (train_shifted_preds[train_mask] == 
+                    train_shifted_targs[train_mask]).sum().item()
+            total   = train_mask.sum().item()
+
+            # aggregate stats using shifted counts
+            running_loss   += loss.item() * total
+            running_tokens += total
+            running_correct+= correct
 
             # log train metrics to WandB every batch
             wandb.log(
@@ -190,11 +211,6 @@ def main():
                 step=global_step,
                 commit=False,
             )
-
-            # aggregate stats
-            running_loss   += loss.item() * B
-            running_tokens += total
-            running_correct+= correct
 
             # Log train metrics every 4 batches
             train_iter.set_postfix(loss=loss.item())
@@ -227,17 +243,22 @@ def main():
 
                     # 4) flatten for loss
                     Bv, Tv, Vv = logits_v.shape
-                    flat_logits_v = logits_v.reshape(Bv * Tv, Vv)   # (Bv*Tv, Vv)
-                    flat_targets_v = ids_v.view(Bv * Tv)            # (Bv*Tv,)
+                    # Shift and flatten logits and targets:
+                    flat_logits_v = logits_v[:, :-1, :].reshape(Bv * (Tv - 1), Vv)
+                    flat_targets_v = ids_v[:, 1:].reshape(Bv * (Tv - 1))
 
-                    # 5) compute loss & accuracy
                     loss_v = loss_fn(flat_logits_v, flat_targets_v)
-                    preds_v = logits_v.argmax(-1)                   # (Bv, Tv)
-                    # only count non-pad tokens
-                    non_pad = ids_v != pad_id                        # (Bv, Tv) bool
-                    correct_v = (preds_v.eq(ids_v) & non_pad).sum().item()
-                    total_v   = non_pad.sum().item()
+
+                    # 5) compute loss & accuracy on NEXT‐token shift
+                    # shifted predictions and targets
+                    shifted_preds = logits_v[:, :-1, :].argmax(-1)  # (Bv, Tv-1)
+                    shifted_targs = ids_v[:, 1:]                    # (Bv, Tv-1)
+                    # mask out pad tokens in targets
+                    mask = shifted_targs != pad_id                  # (Bv, Tv-1) bool
+                    correct_v = (shifted_preds[mask] == shifted_targs[mask]).sum().item()
+                    total_v   = mask.sum().item()
                     acc_v     = correct_v / total_v if total_v > 0 else 0.0
+
 
                 # 6) log to wandb (or print), then back to train mode
                 wandb.log({
@@ -253,13 +274,12 @@ def main():
                 # back to train mode
                 model.train()
 
-
-
         # Epoch metrics & scheduler
-        train_loss = running_loss   / len(train_ds)
+        train_loss = running_loss   / running_tokens
         train_acc  = running_correct / running_tokens
 
         # full-validation at epoch end
+        print(f"Validating epoch {epoch}, this may take a while...")
         val_loss = 0.0
         val_corr = 0
         val_tok  = 0
@@ -274,17 +294,20 @@ def main():
                 logits_v = model(imgs_v, txt_v, mask_v)
                 Bv, Tv, Vv = logits_v.shape
 
-                # flatten for loss with reshape
-                flat_logits_v = logits_v.reshape(Bv * Tv, Vv)
-                flat_targets_v = ids_v.reshape(Bv * Tv).to(device)
+                # Shift and flatten logits and targets:
+                flat_logits_v = logits_v[:, :-1, :].reshape(Bv * (Tv - 1), Vv)
+                flat_targets_v = ids_v[:, 1:].reshape(Bv * (Tv - 1))
                 l = loss_fn(flat_logits_v, flat_targets_v)
-                val_loss += l.item() * Bv
+                val_loss += l.item() * mask.sum().item()
 
-                preds_v   = logits_v.argmax(-1)
-                val_corr += ((preds_v == ids_v) & (ids_v != pad_id)).sum().item()
-                val_tok  += (ids_v != pad_id).sum().item()
+                # next‐token shift for validation accuracy
+                shifted_preds = logits_v[:, :-1, :].argmax(-1)  # (Bv, Tv-1)
+                shifted_targs = ids_v[:, 1:]                    # (Bv, Tv-1)
+                mask = shifted_targs != pad_id                  # ignore pads
+                val_corr += (shifted_preds[mask] == shifted_targs[mask]).sum().item()
+                val_tok  += mask.sum().item()
 
-        val_loss = val_loss / len(val_ds)
+        val_loss = val_loss / val_tok
         val_acc  = val_corr  / val_tok
 
         scheduler.step(val_loss)
