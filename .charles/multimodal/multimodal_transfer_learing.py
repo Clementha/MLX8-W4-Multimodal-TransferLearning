@@ -17,6 +17,7 @@ import time
 from functools import partial
 from pathlib import Path
 from typing import Dict, List, Tuple
+import ast  # Add this import for parsing the prompt list
 
 import torch
 import torch.nn as nn
@@ -79,7 +80,16 @@ WANDB_PROJECT: str = os.getenv("WANDB_PROJECT", "mlx8-w4-multimodal-transferlear
 # Inference settings
 INFERENCE_PROMPT: str = os.getenv("INFERENCE_PROMPT", "Examine the image carefully and provide a detailed description covering objects, people, actions, background, and any notable visual elements")
 
+# Training prompt settings
+USE_PROMPT_VARIATION: bool = os.getenv("USE_PROMPT_VARIATION", "False").lower() == "true"
+PROMPT_DROPOUT_RATE: float = float(os.getenv("PROMPT_DROPOUT_RATE", "0.15"))
+PROMPT_RANDOM_SELECTION: bool = os.getenv("PROMPT_RANDOM_SELECTION", "True").lower() == "true"
+PROMPT_SHUFFLE_PER_EPOCH: bool = os.getenv("PROMPT_SHUFFLE_PER_EPOCH", "True").lower() == "true"
+
 BATCH_SAMPLING: int = int(os.getenv("BATCH_SAMPLING", "200"))  # Convert to int for proper usage
+
+# Parse prompt pool from environment (after logger is initialized)
+PROMPT_VARIATION_POOL: List[str] = []  # Initialize empty, will be populated later
 
 # ---------------------------------------------------------------------------- #
 
@@ -103,6 +113,16 @@ colour_handler.setFormatter(
 )
 logging.basicConfig(level=logging.INFO, handlers=[colour_handler])
 log = logging.getLogger("MMTL")
+
+# Now safely parse prompt pool after logger is available
+try:
+    PROMPT_VARIATION_POOL = ast.literal_eval(os.getenv("PROMPT_VARIATION_POOL", '["Describe this image.", "What do you see?"]'))
+    log.info(f"📝 Loaded {len(PROMPT_VARIATION_POOL)} prompts for training variation")
+except (ValueError, SyntaxError) as e:
+    log.warning(f"⚠️ Failed to parse PROMPT_VARIATION_POOL: {e}, using defaults")
+    PROMPT_VARIATION_POOL = ["Describe this image.", "What do you see?", "Analyze the visual content."]
+
+# ...existing code...
 
 ###############################################################################
 # 3.  Core model components                                                   #
@@ -460,18 +480,37 @@ class MultimodalTransferLearning:
         """Setup data loaders using pre-processed dataset with embeddings"""
         log.info("⏳ Setting up data loaders...")
         
+        def get_random_prompt():
+            """Get a random prompt based on configuration"""
+            if not USE_PROMPT_VARIATION:
+                return INFERENCE_PROMPT
+            
+            # Apply prompt dropout
+            if random.random() < PROMPT_DROPOUT_RATE:
+                return ""  # No prompt (SOS/EOS style)
+            
+            # Select random prompt from pool
+            if PROMPT_RANDOM_SELECTION and PROMPT_VARIATION_POOL:
+                return random.choice(PROMPT_VARIATION_POOL)
+            
+            return INFERENCE_PROMPT
+        
         def preprocess(example):
-            # For training: tokenize the caption with the inference prompt
-            # This ensures consistency between training and inference
-            prompt = INFERENCE_PROMPT + ": "
+            # For training: use random prompts for variety
+            prompt = get_random_prompt()
+            
+            # Add colon separator if prompt is not empty
+            prompt_text = prompt + ": " if prompt else ""
+            
             tokens = self.tokenizer(
-                prompt + example['caption'], 
+                prompt_text + example['caption'], 
                 truncation=True, 
                 padding=False,
                 return_tensors="pt"
             )
             example["input_ids"] = tokens.input_ids[0]
             example["original_caption"] = example["caption"]
+            example["used_prompt"] = prompt  # Track which prompt was used
             return example
 
         # Custom collate function to handle variable-length sequences
@@ -517,7 +556,14 @@ class MultimodalTransferLearning:
             }
 
         # Process datasets to add tokenized captions
-        log.info("Tokenizing captions with prompts...")
+        log.info(f"Tokenizing captions with {'random prompts' if USE_PROMPT_VARIATION else 'fixed prompt'}...")
+        log.info(f"📝 Prompt settings: variation={USE_PROMPT_VARIATION}, dropout={PROMPT_DROPOUT_RATE:.2f}, pool_size={len(PROMPT_VARIATION_POOL)}")
+        
+        # Shuffle prompts per epoch if enabled
+        if PROMPT_SHUFFLE_PER_EPOCH and USE_PROMPT_VARIATION:
+            random.shuffle(PROMPT_VARIATION_POOL)
+            log.info("🔀 Shuffled prompt pool for this epoch")
+        
         self.dataset["train"] = self.dataset["train"].map(
             preprocess, 
             remove_columns=["caption"],
@@ -525,15 +571,29 @@ class MultimodalTransferLearning:
             desc="Processing train"
         )
         
+        # For eval/test, always use the inference prompt for consistency
+        def preprocess_eval(example):
+            prompt = INFERENCE_PROMPT + ": "
+            tokens = self.tokenizer(
+                prompt + example['caption'], 
+                truncation=True, 
+                padding=False,
+                return_tensors="pt"
+            )
+            example["input_ids"] = tokens.input_ids[0]
+            example["original_caption"] = example["caption"]
+            example["used_prompt"] = INFERENCE_PROMPT
+            return example
+        
         self.dataset["eval"] = self.dataset["eval"].map(
-            preprocess, 
+            preprocess_eval, 
             remove_columns=["caption"],
             batch_size=1000,
             desc="Processing eval"
         )
         
         self.dataset["test"] = self.dataset["test"].map(
-            preprocess, 
+            preprocess_eval, 
             remove_columns=["caption"],
             batch_size=1000,
             desc="Processing test"
@@ -805,7 +865,14 @@ class MultimodalTransferLearning:
 
     def train(self):
         log.info(f"🏃 Starting training for {EPOCHS} epochs...")
+        log.info(f"📝 Using {'random prompts' if USE_PROMPT_VARIATION else 'fixed prompt'} during training")
+        
         for epoch in range(EPOCHS):
+            # Shuffle prompts at the beginning of each epoch if enabled
+            if PROMPT_SHUFFLE_PER_EPOCH and USE_PROMPT_VARIATION:
+                random.shuffle(PROMPT_VARIATION_POOL)
+                log.info(f"🔀 Epoch {epoch+1}: Shuffled prompt pool")
+            
             # Set training mode only for trainable components
             if TOP_K > 0:
                 self.qwen.train()
@@ -1153,15 +1220,121 @@ class MultimodalTransferLearning:
         return torch.stack(embeddings)
 
     def run_inference(self, image_paths: List[str]) -> List[str]:
-        """Run inference on a batch of images"""
+        """Run inference on a batch of images using consistent INFERENCE_PROMPT"""
         log.info(f"🔮 Running inference on {len(image_paths)} images...")
+        log.info(f"📝 Using inference prompt: '{INFERENCE_PROMPT[:50]}...'")
         
         # Encode images
         img_embeddings = self._encode_images_batch(image_paths)
         img_embeddings = img_embeddings.to(self.device)
         
-        # Generate captions using shared method
-        captions = self._generate_captions_from_embeddings(img_embeddings, max_new_tokens=64)
+        # For inference, we use the same approach as evaluation:
+        # Visual tokens + inference prompt for consistency
+        captions = []
+        batch_size = min(BATCH_SIZE, len(img_embeddings))
+        
+        # Ensure model is in eval mode
+        self.qwen.eval()
+        self.bridge.eval()
+        
+        for i in range(0, len(img_embeddings), batch_size):
+            batch_embeddings = img_embeddings[i:i+batch_size]
+            
+            try:
+                # Bridge: img_emb -> vis_tokens
+                vis_tokens = self.bridge(batch_embeddings)
+                vis_tokens = vis_tokens.to(dtype=self.qwen_dtype)
+                
+                batch_size_actual = vis_tokens.shape[0]
+                
+                # Tokenize the inference prompt for each sample in batch
+                prompt_text = INFERENCE_PROMPT + ": "
+                prompt_tokens = self.tokenizer(
+                    [prompt_text] * batch_size_actual, 
+                    return_tensors="pt", 
+                    padding=True
+                ).to(self.device)
+                
+                # Get prompt embeddings
+                prompt_emb = self.qwen.get_input_embeddings()(prompt_tokens.input_ids)
+                
+                # Concatenate visual tokens + prompt embeddings
+                inputs = torch.cat([vis_tokens, prompt_emb], dim=1)
+                
+                # Create attention mask for visual + prompt tokens
+                vis_seq_len = vis_tokens.shape[1]
+                vis_attention = torch.ones((batch_size_actual, vis_seq_len), device=self.device, dtype=prompt_tokens.attention_mask.dtype)
+                full_attention_mask = torch.cat([vis_attention, prompt_tokens.attention_mask], dim=1)
+                
+                with torch.no_grad():
+                    try:
+                        # Generate with visual + prompt context
+                        outputs = self.qwen.generate(
+                            inputs_embeds=inputs,
+                            attention_mask=full_attention_mask,
+                            max_new_tokens=64,
+                            min_new_tokens=1,
+                            do_sample=True,
+                            temperature=0.8,
+                            top_p=0.92,
+                            top_k=50,
+                            pad_token_id=self.tokenizer.pad_token_id,
+                            eos_token_id=self.tokenizer.eos_token_id,
+                            repetition_penalty=1.5,
+                            no_repeat_ngram_size=3,
+                            use_cache=True,
+                            return_dict_in_generate=True
+                        )
+                        
+                        # Extract generated tokens (skip input length)
+                        input_length = inputs.shape[1]
+                        generated_ids = outputs.sequences[:, input_length:]
+                        
+                        # Decode generated tokens
+                        if generated_ids.numel() > 0 and generated_ids.shape[1] > 0:
+                            batch_captions = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+                            batch_captions_clean = []
+                            
+                            for caption in batch_captions:
+                                caption_clean = caption.strip()
+                                
+                                # Remove common artifacts
+                                artifacts_to_remove = [
+                                    "image shows", "the image", "this image", 
+                                    "in the image", "picture shows", "photo shows"
+                                ]
+                                
+                                # Simple cleaning
+                                for artifact in artifacts_to_remove:
+                                    if caption_clean.lower().startswith(artifact):
+                                        caption_clean = caption_clean[len(artifact):].strip()
+                                
+                                # Remove leading punctuation/symbols
+                                while caption_clean and caption_clean[0] in ":.,!?-() ":
+                                    caption_clean = caption_clean[1:].strip()
+                                
+                                # Ensure we have something
+                                if not caption_clean or len(caption_clean) < 3:
+                                    caption_clean = "a scene"
+                                
+                                batch_captions_clean.append(caption_clean)
+                        else:
+                            # No tokens generated - use fallback
+                            batch_captions_clean = ["no description available"] * batch_size_actual
+                    
+                    except Exception as gen_error:
+                        log.warning(f"⚠️ Generation failed: {gen_error}")
+                        # Fallback to visual-only generation like before
+                        batch_captions_clean = self._generate_captions_from_embeddings(batch_embeddings, max_new_tokens=32)
+                
+                captions.extend(batch_captions_clean)
+                
+            except Exception as batch_error:
+                log.error(f"❌ Batch processing failed: {batch_error}")
+                # Emergency fallback
+                batch_size_actual = len(batch_embeddings)
+                emergency_captions = ["processing error"] * batch_size_actual
+                captions.extend(emergency_captions)
         
         return captions
     
