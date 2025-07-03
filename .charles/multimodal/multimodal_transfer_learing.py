@@ -461,10 +461,11 @@ class MultimodalTransferLearning:
         log.info("⏳ Setting up data loaders...")
         
         def preprocess(example):
-            # For training: tokenize just the caption (no prompt)
-            # This ensures the model learns to generate clean captions
+            # For training: tokenize the caption with the inference prompt
+            # This ensures consistency between training and inference
+            prompt = INFERENCE_PROMPT + ": "
             tokens = self.tokenizer(
-                example['caption'], 
+                prompt + example['caption'], 
                 truncation=True, 
                 padding=False,
                 return_tensors="pt"
@@ -736,48 +737,71 @@ class MultimodalTransferLearning:
 
     def _generate_sample_during_training(self, batch, num_samples: int = 3):
         """Generate sample captions during training for debugging"""
+        # Store original training state
+        qwen_training = self.qwen.training
+        bridge_training = self.bridge.training
+        
+        # Set to eval mode for generation
         self.qwen.eval()
         self.bridge.eval()
         
-        with torch.no_grad():
-            # Take first few samples from batch
-            sample_embeddings = batch["embedding"][:num_samples].to(self.device)
+        try:
+            with torch.no_grad():
+                # Take first few samples from batch
+                sample_embeddings = batch["embedding"][:num_samples].to(self.device)
+                
+                # Get original captions for reference
+                sample_refs = []
+                if "original_caption" in batch:
+                    for i in range(min(num_samples, len(batch["original_caption"]))):
+                        sample_refs.append(batch["original_caption"][i])
+                else:
+                    # Fallback: decode from input_ids
+                    sample_input_ids = batch["input_ids"][:num_samples]
+                    for ids in sample_input_ids:
+                        decoded = self.tokenizer.decode(ids, skip_special_tokens=True)
+                        sample_refs.append(decoded)
+                
+                # Generate captions with shorter max_new_tokens for training samples
+                sample_preds = self._generate_captions_from_embeddings(sample_embeddings, max_new_tokens=20)
+                
+                # Ensure we have the right number of predictions
+                while len(sample_preds) < len(sample_refs):
+                    sample_preds.append("no prediction")
+                
+                # Compute lightweight metrics for this sample
+                sample_metrics = self._compute_lightweight_metrics(sample_preds, sample_refs)
+                
+                log.info("📝 Training samples:")
+                for i, (pred, ref) in enumerate(zip(sample_preds, sample_refs)):
+                    log.info(f"  Sample {i+1}:")
+                    print(f"    \033[92mRef:  {ref}\033[0m")   # Green (reference first)
+                    print(f"    \033[93mPred: {pred}\033[0m")  # Yellow (prediction second)
             
-            # Get original captions for reference
-            sample_refs = []
-            if "original_caption" in batch:
-                for i in range(min(num_samples, len(batch["original_caption"]))):
-                    sample_refs.append(batch["original_caption"][i])
-            else:
-                # Fallback: decode from input_ids (no prompt removal needed now)
-                sample_input_ids = batch["input_ids"][:num_samples]
-                for ids in sample_input_ids:
-                    decoded = self.tokenizer.decode(ids, skip_special_tokens=True)
-                    sample_refs.append(decoded)
-            
-            # Generate captions using full generation pipeline
-            sample_preds = self._generate_captions_from_embeddings(sample_embeddings, max_new_tokens=30)
-            
-            # Compute lightweight metrics for this sample
-            sample_metrics = self._compute_lightweight_metrics(sample_preds, sample_refs)
-            
-            log.info("📝 Training samples:")
-            for i, (pred, ref) in enumerate(zip(sample_preds, sample_refs)):
-                log.info(f"  Sample {i+1}:")
-                print(f"    \033[93mPred: {pred}\033[0m")  # Yellow
-                print(f"    \033[92mRef:  {ref}\033[0m")   # Green
-            
-            # Log sample metrics
-            log.info(f"📊 Sample metrics: len_ratio={sample_metrics['length_ratio']:.2f}, "
-                    f"word_overlap={sample_metrics['word_overlap']:.1f}%, "
-                    f"non_empty={sample_metrics['non_empty_ratio']:.1f}%")
-            
-            return sample_metrics
-        
-        # Return to training mode
-        if TOP_K > 0:
-            self.qwen.train()
-        self.bridge.train()
+                # Log sample metrics
+                log.info(f"📊 Sample metrics: len_ratio={sample_metrics['length_ratio']:.2f}, "
+                        f"word_overlap={sample_metrics['word_overlap']:.1f}%," 
+                        f" non_empty={sample_metrics['non_empty_ratio']:.1f}%")
+                
+                return sample_metrics
+                
+        except Exception as e:
+            log.error(f"❌ Sample generation failed: {e}")
+            # Return empty metrics
+            return {
+                'avg_pred_length': 0.0,
+                'avg_ref_length': 0.0, 
+                'length_ratio': 0.0,
+                'non_empty_ratio': 0.0,
+                'word_overlap': 0.0,
+                'sample_count': 0
+            }
+        finally:
+            # Restore original training state
+            if qwen_training:
+                self.qwen.train()
+            if bridge_training:
+                self.bridge.train()
 
     def train(self):
         log.info(f"🏃 Starting training for {EPOCHS} epochs...")
@@ -849,137 +873,123 @@ class MultimodalTransferLearning:
         captions = []
         batch_size = min(BATCH_SIZE, len(img_embeddings))
         
+        # Ensure model is in eval mode
+        self.qwen.eval()
+        self.bridge.eval()
+        
         for i in range(0, len(img_embeddings), batch_size):
             batch_embeddings = img_embeddings[i:i+batch_size]
             
-            # Bridge: img_emb -> vis_tokens
-            vis_tokens = self.bridge(batch_embeddings)
-            vis_tokens = vis_tokens.to(dtype=self.qwen_dtype)
-            
-            # Create prompt tokens for inference consistency
-            prompt_text = INFERENCE_PROMPT
-            prompt_tokens = self.tokenizer(
-                prompt_text, 
-                return_tensors="pt", 
-                add_special_tokens=False
-            ).input_ids.to(self.device)
-            
-            # Expand prompt for batch
-            batch_size_actual = vis_tokens.shape[0]
-            prompt_tokens = prompt_tokens.repeat(batch_size_actual, 1)
-            prompt_emb = self.qwen.get_input_embeddings()(prompt_tokens)
-            
-            # Add colon token after prompt
-            colon_token = self.tokenizer(":", return_tensors="pt", add_special_tokens=False).input_ids.to(self.device)
-            colon_token = colon_token.repeat(batch_size_actual, 1)
-            colon_emb = self.qwen.get_input_embeddings()(colon_token)
-            
-            # Concatenate: [visual_tokens, prompt_tokens, colon_token]
-            full_inputs = torch.cat([vis_tokens, prompt_emb, colon_emb], dim=1)
-            
-            # Create attention mask
-            total_seq_len = full_inputs.shape[1]
-            full_attention = torch.ones(
-                (batch_size_actual, total_seq_len), 
-                device=self.device,
-                dtype=torch.long
-            )
-            
-            # Fixed generation parameters - avoid max_length/max_new_tokens conflict
-            with torch.no_grad():
-                outputs = self.qwen.generate(
-                    inputs_embeds=full_inputs,
-                    attention_mask=full_attention,
-                    max_new_tokens=max_new_tokens,  # Only use max_new_tokens
-                    min_new_tokens=3,  # Reduced from 5 to be less restrictive
-                    do_sample=True,
-                    temperature=0.8,  # Slightly higher for more diversity
-                    top_p=0.9,
-                    top_k=50,  # Add top_k for better control
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    return_dict_in_generate=True
-                )
-            
-            # Extract only the newly generated tokens
-            skip_len = total_seq_len
-            generated_ids = outputs.sequences[:, skip_len:]
-            
-            # Enhanced debug logging (only once)
-            if not hasattr(self, '_logged_generation'):
-                log.info(f"🔍 Generation debug:")
-                log.info(f"  Input length: {total_seq_len}")
-                log.info(f"  Output length: {outputs.sequences.shape[1]}")
-                log.info(f"  Generated tokens: {generated_ids.shape[1]}")
-                log.info(f"  Generation config: max_new_tokens={max_new_tokens}, min_new_tokens=3")
-                log.info(f"  Pad token ID: {self.tokenizer.pad_token_id}")
-                log.info(f"  EOS token ID: {self.tokenizer.eos_token_id}")
-                if generated_ids.shape[1] > 0:
-                    log.info(f"  First generated tokens: {generated_ids[0][:10].tolist()}")
-                self._logged_generation = True
-            
-            # Handle generation failure with better fallback
-            if generated_ids.numel() == 0 or outputs.sequences.shape[1] <= total_seq_len:
-                log.warning("⚠️ No new tokens generated, using simplified approach")
-                # Simplified generation: just visual tokens without prompt
-                simple_outputs = self.qwen.generate(
-                    inputs_embeds=vis_tokens,
-                    max_new_tokens=15,  # Shorter for better success rate
-                    min_new_tokens=1,   # Very permissive
-                    do_sample=True,
-                    temperature=1.0,    # More random for better generation
-                    top_p=0.95,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    return_dict_in_generate=True
-                )
-                simple_generated = simple_outputs.sequences[:, vis_tokens.shape[1]:]
+            try:
+                # Bridge: img_emb -> vis_tokens
+                vis_tokens = self.bridge(batch_embeddings)
+                vis_tokens = vis_tokens.to(dtype=self.qwen_dtype)
                 
-                if simple_generated.numel() > 0:
-                    batch_captions = self.tokenizer.batch_decode(simple_generated, skip_special_tokens=True)
-                    batch_captions_clean = [f"[Fallback] {cap.strip()}" for cap in batch_captions if cap.strip()]
-                    # Fill in empty results
-                    while len(batch_captions_clean) < batch_size_actual:
-                        batch_captions_clean.append("[No generation]")
-                else:
-                    batch_captions_clean = ["[Generation failed]"] * batch_size_actual
-            else:
-                # Clean up generated captions
-                batch_captions = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-                batch_captions_clean = []
+                batch_size_actual = vis_tokens.shape[0]
                 
-                for caption in batch_captions:
-                    # Clean and remove any prompt artifacts
-                    caption_clean = caption.strip()
+                # Try simple generation first (just visual tokens)
+                with torch.no_grad():
+                    try:
+                        # Simplified approach: just visual tokens
+                        outputs = self.qwen.generate(
+                            inputs_embeds=vis_tokens,
+                            max_new_tokens=min(max_new_tokens, 50),  # Cap at 30 tokens
+                            min_new_tokens=1,  # Very permissive minimum
+                            do_sample=True,
+                            temperature=0.8,  # Slightly higher temperature for more diversity
+                            top_p=0.92,
+                            top_k=50,
+                            pad_token_id=self.tokenizer.pad_token_id,
+                            eos_token_id=self.tokenizer.eos_token_id,
+                            repetition_penalty=1.5,  # Increased from 1.1 to reduce repetition
+                            no_repeat_ngram_size=3,  # Prevent repeating 3-grams
+                            use_cache=True,
+                            return_dict_in_generate=True
+                        )
+                        
+                        # Extract generated tokens (skip input length)
+                        input_length = vis_tokens.shape[1]
+                        generated_ids = outputs.sequences[:, input_length:]
+                        
+                        # Debug logging (only once)
+                        if not hasattr(self, '_logged_generation'):
+                            log.info(f"🔍 Generation debug:")
+                            log.info(f"  Visual tokens shape: {vis_tokens.shape}")
+                            log.info(f"  Input length: {input_length}")
+                            log.info(f"  Output shape: {outputs.sequences.shape}")
+                            log.info(f"  Generated tokens shape: {generated_ids.shape}")
+                            if generated_ids.shape[1] > 0:
+                                log.info(f"  Sample generated tokens: {generated_ids[0][:5].tolist()}")
+                            self._logged_generation = True
+                        
+                        # Decode generated tokens
+                        if generated_ids.numel() > 0 and generated_ids.shape[1] > 0:
+                            batch_captions = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+                            batch_captions_clean = []
+                            
+                            for caption in batch_captions:
+                                caption_clean = caption.strip()
+                                
+                                # Remove common artifacts
+                                artifacts_to_remove = [
+                                    "image shows", "the image", "this image", 
+                                    "in the image", "picture shows", "photo shows"
+                                ]
+                                
+                                # Simple cleaning
+                                for artifact in artifacts_to_remove:
+                                    if caption_clean.lower().startswith(artifact):
+                                        caption_clean = caption_clean[len(artifact):].strip()
+                                
+                                # Remove leading punctuation/symbols
+                                while caption_clean and caption_clean[0] in ":.,!?-() ":
+                                    caption_clean = caption_clean[1:].strip()
+                                
+                                # Ensure we have something
+                                if not caption_clean or len(caption_clean) < 3:
+                                    caption_clean = "a scene"
+                                
+                                batch_captions_clean.append(caption_clean)
+                        else:
+                            # No tokens generated - use fallback
+                            batch_captions_clean = ["no description available"] * batch_size_actual
                     
-                    # Remove common prompt artifacts
-                    prompt_artifacts = [
-                        INFERENCE_PROMPT.lower(),
-                        "examine the image carefully",
-                        "provide a detailed description",
-                        "covering objects, people, actions"
-                    ]
-                    
-                    for artifact in prompt_artifacts:
-                        if artifact in caption_clean.lower():
-                            idx = caption_clean.lower().find(artifact)
-                            caption_clean = caption_clean[idx + len(artifact):].strip()
-                    
-                    # Remove leading punctuation
-                    while caption_clean and caption_clean[0] in ":.,!?- ":
-                        caption_clean = caption_clean[1:].strip()
-                    
-                    # Fallback for empty captions
-                    if not caption_clean:
-                        caption_clean = "[Empty generation]"
-                    
-                    batch_captions_clean.append(caption_clean)
-            
-            captions.extend(batch_captions_clean)
+                    except Exception as gen_error:
+                        log.warning(f"⚠️ Generation failed: {gen_error}")
+                        # Ultra-simple fallback generation
+                        try:
+                            simple_outputs = self.qwen.generate(
+                                inputs_embeds=vis_tokens,
+                                max_new_tokens=5,
+                                min_new_tokens=1,
+                                do_sample=False,  # Greedy
+                                pad_token_id=self.tokenizer.pad_token_id,
+                                eos_token_id=self.tokenizer.eos_token_id,
+                                use_cache=True
+                            )
+                            
+                            simple_generated = simple_outputs[:, vis_tokens.shape[1]:]
+                            if simple_generated.numel() > 0:
+                                batch_captions_clean = self.tokenizer.batch_decode(simple_generated, skip_special_tokens=True)
+                                batch_captions_clean = [cap.strip() if cap.strip() else "image" for cap in batch_captions_clean]
+                            else:
+                                batch_captions_clean = ["image"] * batch_size_actual
+                        except Exception as fallback_error:
+                            log.warning(f"⚠️ Fallback generation also failed: {fallback_error}")
+                            batch_captions_clean = ["generation failed"] * batch_size_actual
+                
+                captions.extend(batch_captions_clean)
+                
+            except Exception as batch_error:
+                log.error(f"❌ Batch processing failed: {batch_error}")
+                # Emergency fallback
+                batch_size_actual = len(batch_embeddings)
+                emergency_captions = ["processing error"] * batch_size_actual
+                captions.extend(emergency_captions)
 
         return captions
 
-   # --------------------------------------------------------------------- #
+    # --------------------------------------------------------------------- #
     def _save_checkpoint(self, epoch: int):
         """Save checkpoint with proper metadata and validation"""
         # Create filename with all relevant parameters
@@ -1215,8 +1225,8 @@ class MultimodalTransferLearning:
         log.info(f"📝 Sample {split_name} predictions:")
         for i in range(min(3, len(all_preds))):
             print(f"  Sample {i+1}:")
-            print(f"    \033[93mPred: {all_preds[i]}\033[0m")  # Yellow
-            print(f"    \033[92mRef:  {all_refs[i]}\033[0m")   # Green
+            print(f"    \033[92mRef:  {all_refs[i]}\033[0m")   # Green (reference first)
+            print(f"    \033[93mPred: {all_preds[i]}\033[0m")  # Yellow (prediction second)
         
         # Return to training mode if needed
         if not test and TOP_K > 0:
