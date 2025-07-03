@@ -91,3 +91,39 @@ Add (or keep) these lines in `.gitignore` to avoid committing your compiled env:
 The `pyproject.toml` inside `.ben/` **is committed** so everyone sees your dependency list.
 
 Happy coding! 🚀
+
+
+### Download qwen 3b instruct 8bit
+# 1) Bootstrap pip into the venv
+python3 -m ensurepip --upgrade
+
+# 2) Now install accelerate (and bitsandbytes if you haven’t yet)
+python3 -m pip install accelerate --break-system-packages
+python3 -m pip install bitsandbytes --break-system-packages
+
+```
+python3 - << 'EOF'
+import os
+from transformers import AutoModelForVision2Seq, AutoProcessor
+
+token = os.environ["HF_HUB_TOKEN"]
+
+SAVE_DIR = "models/Qwen2.5-VL-3B-Instruct-8bit"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+model = AutoModelForVision2Seq.from_pretrained(
+  "Qwen/Qwen2.5-VL-3B-Instruct",
+  token=token,
+  device_map="cpu",
+  quantization_config={"load_in_8bit": True}
+)
+
+processor = AutoProcessor.from_pretrained(
+  "Qwen/Qwen2.5-VL-3B-Instruct",
+  token=token
+)
+
+model.save_pretrained(SAVE_DIR)
+processor.save_pretrained(SAVE_DIR)
+EOF
+```

@@ -44,6 +44,7 @@ def load_model_and_processor(model_dir: Path):
         torch_dtype=torch.float16,
         device_map={"": device},
     )
+    print("Check model size in bytes:", torch.cuda.memory_reserved(0))
     model.eval()
 
     # Load the single Processor that handles both text & vision

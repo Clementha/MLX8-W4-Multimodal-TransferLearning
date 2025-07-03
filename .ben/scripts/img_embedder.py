@@ -21,7 +21,7 @@ class ImgEmbedder:
   def __init__(
     self,
     model_name: str,
-    choice: str = "CLIP"
+    choice: str = "ViT"
   ) -> None:
     """
     Args:
