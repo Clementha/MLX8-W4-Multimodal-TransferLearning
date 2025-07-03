@@ -33,16 +33,16 @@
             "console": "integratedTerminal"
         },
          {
-            "name": "Python: multimodal_transfer_learing.py",
+            "name": "Python: multimodal_transfer_learing.py - embedding",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/.charles/multimodal/multimodal_transfer_learing.py",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}/.charles/multimodal",
-            "args": ["--data"]
+            "args": ["--embedding"]
         },
         {
-            "name": "Python: multimodal_transfer_learing.py",
+            "name": "Python: multimodal_transfer_learing.py - train",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/.charles/multimodal/multimodal_transfer_learing.py",
@@ -51,7 +51,7 @@
             "args": ["--train"]
         },
         {
-            "name": "Python: multimodal_transfer_learing.py",
+            "name": "Python: multimodal_transfer_learing.py - test",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/.charles/multimodal/multimodal_transfer_learing.py",

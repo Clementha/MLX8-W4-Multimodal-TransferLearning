@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import time
 from functools import partial
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -67,6 +68,9 @@ OUTPUT_DIR_MODELS.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR_DATASETS: Path = Path(os.getenv("OUTPUT_DIR_DATASETS", "../.data/datasets"))
 OUTPUT_DIR_DATASETS.mkdir(parents=True, exist_ok=True)
 
+OUTPUT_DIR_CACHE: Path = Path(os.getenv("OUTPUT_DIR_CACHE", "../.data/cache"))
+OUTPUT_DIR_CACHE.mkdir(parents=True, exist_ok=True)
+
 TRAINING_DATASET: str = os.getenv("TRAINING_DATASET", "flickr30k")
 
 WANDB_ENTITY: str = os.getenv("WANDB_ENTITY", "charles-cai")
@@ -120,20 +124,42 @@ class ImageAdapter(nn.Module):
 ###############################################################################
 
 class MultimodalTransferLearning:
-    def __init__(self, prepare_data_only=False):
+    def __init__(self, mode="train"):
+        """
+        Initialize based on mode:
+        - embedding: Only vision encoder needed
+        - train: Only Qwen + bridge needed  
+        - test: Only Qwen + bridge needed
+        """
+        self.mode = mode
         self._set_seed(SEED)
-        if not prepare_data_only:
+        
+        # Debug logging for environment variables
+        log.info(f"🔧 Environment: VISION_ENCODER={VISION_ENCODER}, IMG_EMB_DIM={IMG_EMB_DIM}")
+        
+        if mode == "embedding":
+            log.info("🔄 Embedding mode: Initializing vision encoder only...")
+            self._init_vision()
+            self._generate_embeddings()
+            log.info("✅ Embedding generation complete!")
+            return
+            
+        elif mode in ["train", "test"]:
+            log.info(f"🔄 {mode.title()} mode: Initializing Qwen + bridge...")
             self._init_wandb()
-        self._init_vision()
-        if not prepare_data_only:
             self._init_qwen()
+            log.info(f"🔧 Creating ImageAdapter: in_dim={IMG_EMB_DIM}, vision_encoder={VISION_ENCODER}")
             self.bridge = ImageAdapter(IMG_EMB_DIM).to(self.device)
-        self._prepare_data()
-        if not prepare_data_only:
-            self._init_optimisers()
-            log.info("🚀 Initialisation complete. Starting training…")
+            self._load_cached_embeddings()
+            self._prepare_data()
+            
+            if mode == "train":
+                self._init_optimisers()
+                log.info("🚀 Training setup complete!")
+            else:
+                log.info("🚀 Test setup complete!")
         else:
-            log.info("🚀 Data preparation complete.")
+            raise ValueError(f"Invalid mode: {mode}. Use 'embedding', 'train', or 'test'")
 
     # --------------------------------------------------------------------- #
     def _set_seed(self, seed: int):
@@ -185,6 +211,9 @@ class MultimodalTransferLearning:
 
     # --------------------------------------------------------------------- #
     def _init_qwen(self):
+        # Set device first
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
         self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B-Base")
         self.qwen = AutoModelForCausalLM.from_pretrained(
             "Qwen/Qwen3-0.6B-Base", torch_dtype="auto", #attn_implementation="flash_attention_2"
@@ -200,202 +229,237 @@ class MultimodalTransferLearning:
             log.info("🧊 Keeping Qwen fully frozen.")
 
     # --------------------------------------------------------------------- #
-    def _prepare_data(self):
-        # Check if fully processed data already exists
-        processed_dir = OUTPUT_DIR_DATASETS / TRAINING_DATASET / "_processed"
-        dataset_path = processed_dir / "dataset_dict"
-        images_cache_path = processed_dir / "images_cache.pt"
+    def _generate_embeddings(self):
+        """Generate embeddings, prepare data splits, and cache everything together"""
+        cache_file = OUTPUT_DIR_CACHE / f"{VISION_ENCODER}_{TRAINING_DATASET}_complete.pt"
         
-        if (dataset_path.exists() and images_cache_path.exists()):
-            log.info(f"📁 Loading cached dataset and images from {processed_dir}")
-            try:
-                from datasets import load_from_disk
-                self.dataset = load_from_disk(str(dataset_path))
-                self.images_cache = torch.load(images_cache_path, map_location='cpu')
-                log.info(
-                    f"📚 Loaded cached dataset: "
-                    f"{len(self.dataset['train'])} train / {len(self.dataset['eval'])} eval / {len(self.dataset['test'])} test"
-                )
-                log.info(f"🖼️ Loaded {len(self.images_cache)} cached processed images")
-                self._setup_data_loaders()
+        if cache_file.exists():
+            log.warning(f"⚠️ Cache file already exists: {cache_file}")
+            response = input("Overwrite? (y/N): ").strip().lower()
+            if response != 'y':
+                log.info("❌ Aborting embedding generation.")
                 return
-            except Exception as e:
-                log.warning(f"⚠️ Failed to load cached data: {e}. Reprocessing...")
         
-        log.warning("⏳ Loading raw dataset from HuggingFace - this may take several minutes...")
+        log.info("📥 Loading raw dataset...")
         raw = load_dataset("lmms-lab/flickr30k", split="test", token=os.getenv("HF_TOKEN"))
         
-        # First, process all unique images and cache them
-        log.warning("⏳ Processing unique images - this may take time...")
-        self._process_and_cache_images(raw, processed_dir)
+        log.info(f"🔄 Generating embeddings for {len(raw)} images...")
+        embeddings = {}
         
-        log.warning("⏳ Flattening dataset (creating image-caption pairs)...")
-        def flatten_generator():
-            for i, example in enumerate(tqdm(raw, desc="Flattening dataset")):
-                # Use image index as key instead of storing image data
-                for caption in example["caption"]:
-                    yield {"image_idx": i, "caption": caption}
-
-        flat_dataset = Dataset.from_generator(flatten_generator)
+        # Process in batches for efficiency
+        batch_size = 32 if self.device.type == "cuda" else 8
         
-        # split 80/10/10 with fixed seed
-        log.info("Splitting dataset 80/10/10...")
-        train_test = flat_dataset.train_test_split(test_size=0.2, seed=SEED)
-        eval_test = train_test["test"].train_test_split(test_size=0.5, seed=SEED)
-        self.dataset = DatasetDict({
-            "train": train_test["train"],
-            "eval": eval_test["train"],
-            "test": eval_test["test"],
-        })
-        
-        log.info(
-            f"📚 Dataset split: "
-            f"{len(self.dataset['train'])} train / {len(self.dataset['eval'])} eval / {len(self.dataset['test'])} test"
-        )
-        
-        # Save processed dataset to disk for future use
-        log.info(f"💾 Caching processed dataset to {processed_dir}")
-        processed_dir.mkdir(parents=True, exist_ok=True)
-        self.dataset.save_to_disk(str(dataset_path))
-        
-        self._setup_data_loaders()
-    
-    def _process_and_cache_images(self, raw_dataset, processed_dir):
-        """Process all unique images once and cache the results"""
-        processed_dir.mkdir(parents=True, exist_ok=True)
-        images_cache_path = processed_dir / "images_cache.pt"
-        
-        # Check if images are already cached
-        if images_cache_path.exists():
-            try:
-                self.images_cache = torch.load(images_cache_path, map_location='cpu')
-                expected_count = len(raw_dataset)
-                if len(self.images_cache) == expected_count:
-                    log.info(f"🖼️ Using existing cached images ({len(self.images_cache)} images)")
-                    return
-                else:
-                    log.warning(f"⚠️ Cached images count mismatch. Expected {expected_count}, got {len(self.images_cache)}. Reprocessing...")
-            except Exception as e:
-                log.warning(f"⚠️ Failed to load cached images: {e}. Reprocessing...")
-        
-        log.info("🔄 Processing and caching images...")
-        self.images_cache = {}
-        
-        # Move processor to GPU if possible and supported
-        processor_device = self.device if self._can_use_gpu_for_processing() else "cpu"
-        if processor_device == "cuda":
-            log.info("🚀 Using GPU acceleration for image processing")
-        
-        # Process images in batches to optimize GPU usage
-        batch_size = 32 if processor_device == "cuda" else 8
-        
-        for i in tqdm(range(0, len(raw_dataset), batch_size), desc="Processing image batches"):
-            batch_end = min(i + batch_size, len(raw_dataset))
-            batch_images = [raw_dataset[j]["image"] for j in range(i, batch_end)]
+        for i in tqdm(range(0, len(raw), batch_size), desc="Processing image batches"):
+            batch_end = min(i + batch_size, len(raw))
+            batch_images = [raw[j]["image"] for j in range(i, batch_end)]
             
             try:
+                # Process batch
                 if VISION_ENCODER == "vit":
                     batch_pixels = self.processor(images=batch_images, return_tensors="pt").pixel_values
                 else:
                     batch_pixels = self.processor(images=batch_images, return_tensors="pt").pixel_values
                 
-                # Move to specified device
-                if processor_device == "cuda":
-                    batch_pixels = batch_pixels.to(self.device)
+                batch_pixels = batch_pixels.to(self.device)
                 
-                # Store each processed image
-                for j, pixel_tensor in enumerate(batch_pixels):
-                    self.images_cache[i + j] = pixel_tensor.cpu()  # Always store on CPU to save GPU memory
+                # Generate embeddings
+                with torch.no_grad():
+                    if VISION_ENCODER == "vit":
+                        batch_embeddings = self.vision_encoder(batch_pixels)[0][:, 0]  # CLS token
+                    else:
+                        # Use CLIP's get_image_features method for proper 512-dim embeddings
+                        batch_embeddings = self.vision_encoder.get_image_features(pixel_values=batch_pixels)
+                
+                # Store embeddings (move to CPU to save GPU memory)
+                for j, embedding in enumerate(batch_embeddings):
+                    img_id = i + j
+                    embeddings[img_id] = embedding.cpu()
                     
             except Exception as e:
-                log.warning(f"⚠️ Batch processing failed at batch {i}, falling back to individual processing: {e}")
+                log.warning(f"⚠️ Batch processing failed at {i}, falling back to individual: {e}")
                 # Fallback to individual processing
                 for j in range(i, batch_end):
                     try:
-                        image = raw_dataset[j]["image"]
+                        img_id = j
+                        image = raw[img_id]["image"]
+                        
                         if VISION_ENCODER == "vit":
-                            pixel = self.processor(images=image, return_tensors="pt").pixel_values[0]
+                            pixels = self.processor(images=image, return_tensors="pt").pixel_values
                         else:
-                            pixel = self.processor(images=image, return_tensors="pt").pixel_values[0]
-                        self.images_cache[j] = pixel.cpu()
+                            pixels = self.processor(images=image, return_tensors="pt").pixel_values
+                        
+                        pixels = pixels.to(self.device)
+                        
+                        with torch.no_grad():
+                            if VISION_ENCODER == "vit":
+                                embedding = self.vision_encoder(pixels)[0][:, 0]  # CLS token
+                            else:
+                                # Use CLIP's get_image_features method for proper 512-dim embeddings
+                                embedding = self.vision_encoder.get_image_features(pixel_values=pixels)[0]
+                        
+                        embeddings[img_id] = embedding.cpu()
+                        
                     except Exception as e2:
                         log.error(f"❌ Failed to process image {j}: {e2}")
-                        # Create a dummy tensor as fallback
-                        dummy_size = (3, 224, 224)  # Standard size
-                        self.images_cache[j] = torch.zeros(dummy_size)
+                        # Create zero embedding as fallback
+                        embeddings[j] = torch.zeros(IMG_EMB_DIM)
         
-        log.info(f"💾 Saving {len(self.images_cache)} processed images to cache")
-        torch.save(self.images_cache, images_cache_path)
-        log.info(f"✅ Images cached to {images_cache_path}")
-    
-    def _can_use_gpu_for_processing(self):
-        """Check if GPU can be used for image processing"""
-        if not torch.cuda.is_available():
-            return False
+        # Keep embeddings in memory for data preparation
+        self.embeddings_cache = embeddings
+        log.info(f"✅ Generated {len(embeddings)} embeddings, keeping in memory")
         
-        # Test if processor can work with CUDA tensors
+        # Now prepare data splits with embeddings
+        log.info("⏳ Creating image-caption pairs with embeddings...")
+        processed_examples = []
+        
+        for img_id, example in enumerate(tqdm(raw, desc="Processing examples")):
+            img_embedding = embeddings[img_id]
+            for caption in example["caption"]:
+                processed_examples.append({
+                    "embedding": img_embedding,
+                    "caption": caption
+                })
+        
+        # Convert to dataset and split
+        log.info("📊 Creating dataset and splitting 80/10/10...")
+        flat_dataset = Dataset.from_list(processed_examples)
+        
+        train_test = flat_dataset.train_test_split(test_size=0.2, seed=SEED)
+        eval_test = train_test["test"].train_test_split(test_size=0.5, seed=SEED)
+        
+        processed_dataset = DatasetDict({
+            "train": train_test["train"],
+            "eval": eval_test["train"], 
+            "test": eval_test["test"],
+        })
+        
+        log.info(
+            f"📚 Dataset splits created: "
+            f"{len(processed_dataset['train'])} train / {len(processed_dataset['eval'])} eval / {len(processed_dataset['test'])} test"
+        )
+        
+        # Save everything together
+        cache_data = {
+            'dataset': processed_dataset,
+            'metadata': {
+                'vision_encoder': VISION_ENCODER,
+                'dataset': TRAINING_DATASET,
+                'total_images': len(raw),
+                'total_examples': len(processed_examples),
+                'embedding_dim': IMG_EMB_DIM,
+                'encoder_id': ENCODER_ID,
+                'created_at': torch.tensor([time.time()], dtype=torch.float64)
+            }
+        }
+        
+        log.info(f"💾 Saving complete dataset with embeddings to {cache_file}")
+        torch.save(cache_data, cache_file)
+        log.info(f"✅ Complete dataset cached successfully!")
+        log.info(f"📊 Cache info: {len(processed_examples)} examples, {IMG_EMB_DIM}D embeddings")
+
+    def _load_cached_embeddings(self):
+        """Load cached complete dataset for training/testing"""
+        cache_file = OUTPUT_DIR_CACHE / f"{VISION_ENCODER}_{TRAINING_DATASET}_complete.pt"
+        
+        if not cache_file.exists():
+            log.error(f"❌ Complete dataset cache not found: {cache_file}")
+            log.error(f"💡 Please run: python {__file__} --embedding")
+            raise FileNotFoundError(f"Missing complete dataset cache: {cache_file}")
+        
+        log.info(f"📁 Loading cached complete dataset from {cache_file}")
         try:
-            # Create a small test image
-            import PIL.Image
-            import numpy as np
-            test_img = PIL.Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
+            # Load cache with weights_only=False to handle HuggingFace datasets
+            cache_data = torch.load(cache_file, map_location='cpu', weights_only=False)
             
-            if VISION_ENCODER == "vit":
-                test_result = self.processor(images=test_img, return_tensors="pt").pixel_values
-            else:
-                test_result = self.processor(images=test_img, return_tensors="pt").pixel_values
+            self.dataset = cache_data['dataset']
+            metadata = cache_data['metadata']
             
-            # Try moving to GPU
-            test_result.to(self.device)
-            return True
-        except Exception:
-            return False
-    
+            # Validate cache metadata
+            if metadata['vision_encoder'] != VISION_ENCODER:
+                log.error(f"❌ Cache vision encoder mismatch: {metadata['vision_encoder']} != {VISION_ENCODER}")
+                log.error(f"💡 Delete cache file or set VISION_ENCODER={metadata['vision_encoder']}")
+                raise ValueError(f"Cache vision encoder mismatch: {metadata['vision_encoder']} != {VISION_ENCODER}")
+            if metadata['dataset'] != TRAINING_DATASET:
+                raise ValueError(f"Cache dataset mismatch: {metadata['dataset']} != {TRAINING_DATASET}")
+            if metadata['embedding_dim'] != IMG_EMB_DIM:
+                log.error(f"❌ Cache embedding dimension mismatch: {metadata['embedding_dim']} != {IMG_EMB_DIM}")
+                log.error(f"💡 Delete cache file and regenerate with correct VISION_ENCODER")
+                raise ValueError(f"Cache embedding dimension mismatch: {metadata['embedding_dim']} != {IMG_EMB_DIM}")
+            
+            log.info(f"✅ Loaded complete dataset with {metadata['total_examples']} examples")
+            log.info(f"📊 Cache metadata: {metadata['vision_encoder']}, {metadata['total_images']} images, {metadata['embedding_dim']}D")
+            
+        except Exception as e:
+            log.error(f"❌ Failed to load complete dataset cache: {e}")
+            log.error(f"💡 Please regenerate cache: python {__file__} --embedding")
+            raise
+
+    def _prepare_data(self):
+        # Data is already prepared and loaded, just setup data loaders
+        self._setup_data_loaders()
+
     def _setup_data_loaders(self):
-        """Setup data loaders with preprocessing - separated to avoid code duplication"""
-        log.info("⏳ Setting up data preprocessing and loaders...")
+        """Setup data loaders using pre-processed dataset with embeddings"""
+        log.info("⏳ Setting up data loaders...")
         
         def preprocess(example):
-            # Get preprocessed image from cache using image_idx
-            image_idx = example["image_idx"]
-            pixel = self.images_cache[image_idx]
-            example["pixel"] = pixel
-            
             # Tokenize caption
             example["input_ids"] = self.tokenizer(
                 example["caption"], truncation=True, return_tensors="pt"
             ).input_ids[0]
             return example
 
-        # Process datasets - now much faster since images are pre-processed
-        log.info("Setting up train set...")
+        # Custom collate function to handle variable-length sequences
+        def collate_fn(batch):
+            # Stack embeddings (these are all the same size)
+            embeddings = torch.stack([item["embedding"] for item in batch])
+            
+            # Pad input_ids to the same length within the batch
+            input_ids = [item["input_ids"] for item in batch]
+            max_len = max(len(ids) for ids in input_ids)
+            
+            # Pad sequences with tokenizer's pad_token_id
+            padded_input_ids = []
+            for ids in input_ids:
+                if len(ids) < max_len:
+                    padding = torch.full((max_len - len(ids),), self.tokenizer.pad_token_id, dtype=ids.dtype)
+                    padded_ids = torch.cat([ids, padding])
+                else:
+                    padded_ids = ids
+                padded_input_ids.append(padded_ids)
+            
+            return {
+                "embedding": embeddings,
+                "input_ids": torch.stack(padded_input_ids)
+            }
+
+        # Process datasets to add tokenized captions
+        log.info("Tokenizing captions...")
         self.dataset["train"] = self.dataset["train"].map(
             preprocess, 
-            remove_columns=["image_idx", "caption"],
-            batch_size=1000,  # Can use larger batches now
-            desc="Setting up train"
+            remove_columns=["caption"],
+            batch_size=1000,
+            desc="Processing train"
         )
         
-        log.info("Setting up eval set...")
         self.dataset["eval"] = self.dataset["eval"].map(
             preprocess, 
-            remove_columns=["image_idx", "caption"],
+            remove_columns=["caption"],
             batch_size=1000,
-            desc="Setting up eval"
+            desc="Processing eval"
         )
         
-        log.info("Setting up test set...")
         self.dataset["test"] = self.dataset["test"].map(
             preprocess, 
-            remove_columns=["image_idx", "caption"],
+            remove_columns=["caption"],
             batch_size=1000,
-            desc="Setting up test"
+            desc="Processing test"
         )
         
         self.dataset.set_format(type="torch")
-        self.train_loader = DataLoader(self.dataset["train"], batch_size=BATCH_SIZE, shuffle=True)
-        self.eval_loader = DataLoader(self.dataset["eval"], batch_size=BATCH_SIZE)
-        self.test_loader = DataLoader(self.dataset["test"], batch_size=BATCH_SIZE)
+        self.train_loader = DataLoader(self.dataset["train"], batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+        self.eval_loader = DataLoader(self.dataset["eval"], batch_size=BATCH_SIZE, collate_fn=collate_fn)
+        self.test_loader = DataLoader(self.dataset["test"], batch_size=BATCH_SIZE, collate_fn=collate_fn)
         
         log.info("✅ Data loaders ready!")
 
@@ -439,12 +503,9 @@ class MultimodalTransferLearning:
     # Vision Encoder (frozen)
 
     def _forward_step(self, batch):
-        pixel, caption_ids = batch["pixel"].to(self.device), batch["input_ids"].to(self.device)
-        with torch.no_grad():
-            if VISION_ENCODER == "vit":
-                img_emb = self.vision_encoder(pixel)[0][:, 0]  # CLS
-            else:
-                img_emb = self.vision_encoder(pixel, output_hidden_states=False).image_embeds
+        # Always use cached embedding (no vision encoder needed)
+        img_emb = batch["embedding"].to(self.device)
+        caption_ids = batch["input_ids"].to(self.device)
         
         # Bridge: img_emb (B, 768/512) -> vis_tokens (B, 16, 4096)
         vis_tokens = self.bridge(img_emb)
@@ -463,15 +524,7 @@ class MultimodalTransferLearning:
         labels = torch.cat([vis_labels, caption_ids], dim=1)
         
         # Forward pass through Qwen:
-        # 1. Self-attention across all tokens (visual + text)
-        # 2. Generate logits for next token prediction
-        # 3. Compute CrossEntropyLoss only where labels != -100
         outputs = self.qwen(inputs_embeds=inputs, labels=labels)
-        
-        # Loss calculation (internally in Qwen):
-        # logits: (B, 16+seq_len, vocab_size)
-        # For each text position i: loss += CrossEntropy(logits[i], labels[i])
-        # Visual positions are ignored due to labels[vis_positions] = -100
         return outputs.loss
 
     # --------------------------------------------------------------------- #
@@ -504,6 +557,7 @@ class MultimodalTransferLearning:
 
     # --------------------------------------------------------------------- #
     def train(self):
+        log.info(f"🏃 Starting training for {EPOCHS} epochs...")
         for epoch in range(EPOCHS):
             # Set training mode only for trainable components
             if TOP_K > 0:
@@ -515,11 +569,21 @@ class MultimodalTransferLearning:
                 loss.backward()
                 self.optimizer.step(); self.optimizer.zero_grad()
                 pbar.set_postfix(loss=f"{loss.item():.4f}")
+            
+            # Eval after each epoch
+            log.info(f"📊 Running evaluation after epoch {epoch+1}...")
             self._evaluate(epoch)
             self._save_checkpoint(epoch)
 
-        log.info("🎉 Training complete. Running final test…")
+        # Final test after training
+        log.info("🎯 Training complete! Running final test evaluation...")
+        self.test()
+
+    def test(self):
+        """Run final test evaluation"""
+        log.info("🧪 Running test evaluation...")
         self._evaluate(EPOCHS, test=True)
+        log.info("✅ Test evaluation complete!")
 
     # --------------------------------------------------------------------- #
     def _evaluate(self, epoch: int, test: bool = False):
@@ -528,11 +592,8 @@ class MultimodalTransferLearning:
         preds, refs = [], []
         with torch.no_grad():
             for batch in loader:
-                pixel = batch["pixel"].to(self.device)
-                if VISION_ENCODER == "vit":
-                    img_emb = self.vision_encoder(pixel)[0][:, 0]
-                else:
-                    img_emb = self.vision_encoder(pixel).image_embeds
+                # Always use cached embedding
+                img_emb = batch["embedding"].to(self.device)
                 vis_tokens = self.bridge(img_emb)
                 
                 # Generate text tokens only (excluding visual embedding positions)
@@ -579,28 +640,29 @@ class MultimodalTransferLearning:
 
 def parse_args():
     p = argparse.ArgumentParser(description="Multimodal Transfer‑Learning runner")
-    p.add_argument("--train", action="store_true", help="Train then evaluate")
-    p.add_argument("--test", action="store_true", help="Run standalone test using last checkpoint")
-    p.add_argument("--data", action="store_true", help="Prepare and cache dataset only")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--embedding", action="store_true", help="Generate and cache vision embeddings")
+    group.add_argument("--train", action="store_true", help="Train model using cached embeddings (includes final test)")
+    group.add_argument("--test", action="store_true", help="Run standalone test evaluation using cached embeddings")
     return p.parse_args()
-
 
 def main():
     args = parse_args()
     
-    if args.data:
-        log.info("🔄 Preparing dataset...")
-        engine = MultimodalTransferLearning(prepare_data_only=True)
-        log.info("✅ Dataset preparation complete!")
+    if args.embedding:
+        log.info("🔄 Mode: Embedding generation")
+        engine = MultimodalTransferLearning(mode="embedding")
     elif args.train:
-        engine = MultimodalTransferLearning()
+        log.info("🔄 Mode: Training (with final test)")
+        engine = MultimodalTransferLearning(mode="train")
         engine.train()
     elif args.test:
-        engine = MultimodalTransferLearning()
-        engine._evaluate(epoch=EPOCHS, test=True)
+        log.info("🔄 Mode: Test evaluation")
+        engine = MultimodalTransferLearning(mode="test")
+        engine.test()
+        log.info("✅ Evaluation complete!")
     else:
-        log.error("❌ Must specify either --data, --train, or --test")
-
+        log.error("❌ Must specify either --embedding, --train, or --test")
 
 if __name__ == "__main__":
     main()
