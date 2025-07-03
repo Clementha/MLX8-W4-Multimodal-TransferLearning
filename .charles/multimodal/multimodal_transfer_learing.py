@@ -601,29 +601,48 @@ class MultimodalTransferLearning:
     def _compute_metrics(self, preds: List[str], refs: List[str]) -> Dict[str, float]:
         if not preds or not refs:
             return dict(BLEU4=0.0, CIDEr=0.0, R1=0.0, R5=0.0, P1=0.0, P5=0.0)
+        
+        # Clean predictions and references
+        preds_clean = [pred.strip() for pred in preds if pred.strip()]
+        refs_clean = [ref.strip() for ref in refs if ref.strip()]
+        
+        if not preds_clean or not refs_clean or len(preds_clean) != len(refs_clean):
+            log.warning(f"⚠️ Metrics issue: preds={len(preds_clean)}, refs={len(refs_clean)}")
+            return dict(BLEU4=0.0, CIDEr=0.0, R1=0.0, R5=0.0, P1=0.0, P5=0.0)
             
         try:
             # Load BLEU metric from evaluate
             bleu_metric = evaluate.load("bleu")
             # Convert single strings to lists of references as expected by evaluate
-            bleu_refs = [[ref] for ref in refs]
-            bleu_result = bleu_metric.compute(predictions=preds, references=bleu_refs)
-            bleu = bleu_result["bleu"]
+            bleu_refs = [[ref] for ref in refs_clean]
+            bleu_result = bleu_metric.compute(predictions=preds_clean, references=bleu_refs)
+            bleu = bleu_result["bleu"] * 100  # Convert to percentage
+            log.info(f"📊 BLEU calculation: {len(preds_clean)} pairs, BLEU={bleu:.2f}")
         except Exception as e:
-            print(f"BLEU computation failed: {e}")
+            log.warning(f"⚠️ BLEU computation failed: {e}")
             bleu = 0.0
             
         try:
-            # Load CIDEr metric from evaluate (if available)
-            # Note: CIDEr might not be available in all evaluate versions
-            # Using a fallback approach
-            cider = 0.0  # Placeholder - CIDEr is complex to implement from scratch
+            # Simple ROUGE-L approximation using sentence-level overlap
+            from collections import Counter
+            rouge_scores = []
+            for pred, ref in zip(preds_clean, refs_clean):
+                pred_words = set(pred.lower().split())
+                ref_words = set(ref.lower().split())
+                if ref_words:
+                    rouge_l = len(pred_words & ref_words) / len(ref_words)
+                    rouge_scores.append(rouge_l)
+            rouge_l = sum(rouge_scores) / len(rouge_scores) * 100 if rouge_scores else 0.0
         except:
-            cider = 0.0
+            rouge_l = 0.0
             
-        # Simplified retrieval metrics (dummy implementation)
-        # In practice, you'd use proper sentence embeddings
-        return dict(BLEU4=bleu, CIDEr=cider, R1=0.0, R5=0.0, P1=0.0, P5=0.0)
+        # Return metrics with better names
+        return dict(
+            BLEU4=bleu, 
+            ROUGE_L=rouge_l, 
+            Samples=len(preds_clean),
+            R1=0.0, R5=0.0, P1=0.0
+        )
 
     # --------------------------------------------------------------------- #
     def train(self):
@@ -680,51 +699,110 @@ class MultimodalTransferLearning:
         log.info("✅ Test evaluation complete!")
 
     # --------------------------------------------------------------------- #
+    def _generate_captions_from_embeddings(self, img_embeddings: torch.Tensor, max_new_tokens: int = 50) -> List[str]:
+        """Shared caption generation logic for both evaluation and inference"""
+        captions = []
+        batch_size = BATCH_SIZE
+        
+        for i in range(0, len(img_embeddings), batch_size):
+            batch_embeddings = img_embeddings[i:i+batch_size]
+            
+            # Bridge: img_emb -> vis_tokens
+            vis_tokens = self.bridge(batch_embeddings)
+            vis_tokens = vis_tokens.to(dtype=self.qwen_dtype)
+            
+            # Create prompt tokens: "Please describe the image in details:"
+            prompt_text = INFERENCE_PROMPT + ":"
+            prompt_tokens = self.tokenizer(
+                prompt_text, 
+                return_tensors="pt", 
+                add_special_tokens=False
+            ).input_ids.to(self.device)
+            
+            # Expand prompt for batch
+            batch_size_actual = vis_tokens.shape[0]
+            prompt_tokens = prompt_tokens.repeat(batch_size_actual, 1)
+            prompt_emb = self.qwen.get_input_embeddings()(prompt_tokens)
+            
+            # Concatenate: [visual_tokens, prompt_tokens]
+            full_inputs = torch.cat([vis_tokens, prompt_emb], dim=1)
+            
+            # Create attention mask for visual + prompt tokens
+            vis_seq_len = vis_tokens.shape[1]
+            prompt_seq_len = prompt_tokens.shape[1]
+            full_attention = torch.ones(
+                (batch_size_actual, vis_seq_len + prompt_seq_len), 
+                device=self.device
+            )
+            
+            # Generate captions
+            with torch.no_grad():
+                outputs = self.qwen.generate(
+                    inputs_embeds=full_inputs,
+                    attention_mask=full_attention,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.9,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    return_dict_in_generate=True
+                )
+            
+            # Extract only the newly generated token IDs (skip visual + prompt positions)
+            skip_len = vis_tokens.shape[1] + prompt_tokens.shape[1]
+            generated_ids = outputs.sequences[:, skip_len:]
+            batch_captions = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+            
+            # Clean up captions (remove prompt if it leaked through)
+            batch_captions_clean = []
+            for caption in batch_captions:
+                if prompt_text.lower() in caption.lower():
+                    caption = caption.lower().replace(prompt_text.lower(), "").strip()
+                batch_captions_clean.append(caption.strip())
+            
+            captions.extend(captions)
+
+        return captions
+
+    # --------------------------------------------------------------------- #
     def _evaluate(self, epoch: int, test: bool = False):
         self.qwen.eval(); self.bridge.eval()
         loader = self.test_loader if test else self.eval_loader
         preds, refs = [], []
         eval_losses = []
         
+        # Add progress bar for evaluation
+        tag = "Test" if test else "Eval"
+        pbar = tqdm(loader, desc=f"{tag} evaluation")
+        
+        # Collect all embeddings for batch inference
+        all_embeddings = []
+        all_refs = []
+        
         with torch.no_grad():
-            for batch in loader:
+            for batch in pbar:
                 # Calculate loss for evaluation
                 try:
                     loss = self._forward_step(batch)
                     eval_losses.append(loss.item())
-                except:
-                    pass  # Skip if evaluation loss fails
+                    pbar.set_postfix(loss=f"{loss.item():.4f}")
+                except Exception as e:
+                    log.warning(f"⚠️ Evaluation loss failed: {e}")
                 
-                # Generate predictions
+                # Collect embeddings and references for batch inference
                 img_emb = batch["embedding"].to(self.device)
-                vis_tokens = self.bridge(img_emb)
-                vis_tokens = vis_tokens.to(dtype=self.qwen_dtype)
-                
-                # Create attention mask for visual tokens
-                batch_size, vis_seq_len = vis_tokens.shape[:2]
-                vis_attention = torch.ones((batch_size, vis_seq_len), device=self.device)
-                
-                # Generate text tokens only
-                outputs = self.qwen.generate(
-                    inputs_embeds=vis_tokens,
-                    attention_mask=vis_attention,
-                    max_new_tokens=32,
-                    do_sample=False,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    return_dict_in_generate=True,
-                    output_scores=False
-                )
-                
-                # Extract only the newly generated token IDs (skip visual token positions)
-                generated_ids = outputs.sequences[:, vis_tokens.shape[1]:]
-                
-                # Decode predictions and references
-                batch_preds = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
                 batch_refs = self.tokenizer.batch_decode(batch["input_ids"], skip_special_tokens=True)
                 
-                preds.extend(batch_preds)
-                refs.extend(batch_refs)
-                
+                all_embeddings.append(img_emb)
+                all_refs.extend(batch_refs)
+        
+        # Generate all predictions using shared inference method
+        if all_embeddings:
+            all_embeddings_tensor = torch.cat(all_embeddings, dim=0)
+            preds = self._generate_captions_from_embeddings(all_embeddings_tensor, max_new_tokens=50)
+            refs = all_refs
+        
+        # Compute metrics
         metrics = self._compute_metrics(preds, refs)
         tag = "test" if test else "eval"
         
@@ -735,8 +813,17 @@ class MultimodalTransferLearning:
         if eval_losses:
             avg_eval_loss = sum(eval_losses) / len(eval_losses)
             log_dict[f"{tag}/loss"] = avg_eval_loss
+            log.info(f"📊 {tag.title()} loss: {avg_eval_loss:.4f}")
         
         wandb.log(log_dict)
+        
+        # Log sample predictions for debugging
+        if preds and refs:
+            log.info(f"📝 Sample {tag} predictions:")
+            for i in range(min(3, len(preds))):
+                log.info(f"  Pred: {preds[i]}")
+                log.info(f"  Ref:  {refs[i]}")
+                log.info("")
         
         log.info(f"📊 {tag.title()} metrics at epoch {epoch+1}: {metrics}")
 
@@ -817,38 +904,8 @@ class MultimodalTransferLearning:
         img_embeddings = self._encode_images_batch(image_paths)
         img_embeddings = img_embeddings.to(self.device)
         
-        # Generate captions
-        captions = []
-        batch_size = BATCH_SIZE
-        
-        for i in range(0, len(img_embeddings), batch_size):
-            batch_embeddings = img_embeddings[i:i+batch_size]
-            
-            # Bridge: img_emb -> vis_tokens
-            vis_tokens = self.bridge(batch_embeddings)
-            vis_tokens = vis_tokens.to(dtype=self.qwen_dtype)
-            
-            # Create attention mask for visual tokens
-            batch_size_actual, vis_seq_len = vis_tokens.shape[:2]
-            vis_attention = torch.ones((batch_size_actual, vis_seq_len), device=self.device)
-            
-            # Generate captions
-            with torch.no_grad():
-                outputs = self.qwen.generate(
-                    inputs_embeds=vis_tokens,
-                    attention_mask=vis_attention,
-                    max_new_tokens=64,
-                    do_sample=True,
-                    temperature=0.7,
-                    top_p=0.9,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    return_dict_in_generate=True
-                )
-            
-            # Decode generated captions (skip visual token positions)
-            generated_ids = outputs.sequences[:, vis_tokens.shape[1]:]
-            batch_captions = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-            captions.extend(batch_captions)
+        # Generate captions using shared method
+        captions = self._generate_captions_from_embeddings(img_embeddings, max_new_tokens=64)
         
         return captions
 
