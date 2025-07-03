@@ -58,6 +58,15 @@
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}/.charles/multimodal",
             "args": ["--test"]
+        },
+        {
+            "name": "Python: multimodal_transfer_learing.py - run",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/.charles/multimodal/multimodal_transfer_learing.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/.charles/multimodal",
+            "args": ["--run", "test1.jpg"]
         }
     ]
 }

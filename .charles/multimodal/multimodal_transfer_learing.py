@@ -77,7 +77,7 @@ WANDB_ENTITY: str = os.getenv("WANDB_ENTITY", "charles-cai")
 WANDB_PROJECT: str = os.getenv("WANDB_PROJECT", "mlx8-w4-multimodal-transferlearning")
 
 # Inference settings
-INFERENCE_PROMPT: str = os.getenv("INFERENCE_PROMPT", "Please describe the image in details")
+INFERENCE_PROMPT: str = os.getenv("Examine the image carefully and provide a detailed description covering objects, people, actions, background, and any notable visual elements")
 
 # ---------------------------------------------------------------------------- #
 
@@ -611,37 +611,30 @@ class MultimodalTransferLearning:
             return dict(BLEU4=0.0, CIDEr=0.0, R1=0.0, R5=0.0, P1=0.0, P5=0.0)
             
         try:
-            # Load BLEU metric from evaluate
+            # Load BLEU and ROUGE metrics from evaluate
             bleu_metric = evaluate.load("bleu")
+            rouge_metric = evaluate.load("rouge")
+
             # Convert single strings to lists of references as expected by evaluate
             bleu_refs = [[ref] for ref in refs_clean]
-            bleu_result = bleu_metric.compute(predictions=preds_clean, references=bleu_refs)
-            bleu = bleu_result["bleu"] * 100  # Convert to percentage
-            log.info(f"📊 BLEU calculation: {len(preds_clean)} pairs, BLEU={bleu:.2f}")
-        except Exception as e:
-            log.warning(f"⚠️ BLEU computation failed: {e}")
-            bleu = 0.0
             
-        try:
-            # Simple ROUGE-L approximation using sentence-level overlap
-            from collections import Counter
-            rouge_scores = []
-            for pred, ref in zip(preds_clean, refs_clean):
-                pred_words = set(pred.lower().split())
-                ref_words = set(ref.lower().split())
-                if ref_words:
-                    rouge_l = len(pred_words & ref_words) / len(ref_words)
-                    rouge_scores.append(rouge_l)
-            rouge_l = sum(rouge_scores) / len(rouge_scores) * 100 if rouge_scores else 0.0
-        except:
+            bleu_result = bleu_metric.compute(predictions=preds_clean, references=bleu_refs)
+            rouge_result = rouge_metric.compute(predictions=preds_clean, references=refs_clean)
+
+            bleu = bleu_result["bleu"] * 100  # Convert to percentage
+            rouge_l = rouge_result["rougeL"] * 100 # Convert to percentage
+
+            log.info(f"📊 Metrics calculation: {len(preds_clean)} pairs, BLEU={bleu:.2f}, ROUGE-L={rouge_l:.2f}")
+        except Exception as e:
+            log.warning(f"⚠️ Metrics computation failed: {e}")
+            bleu = 0.0
             rouge_l = 0.0
             
         # Return metrics with better names
         return dict(
             BLEU4=bleu, 
             ROUGE_L=rouge_l, 
-            Samples=len(preds_clean),
-            R1=0.0, R5=0.0, P1=0.0
+            Samples=len(preds_clean)
         )
 
     # --------------------------------------------------------------------- #
@@ -760,7 +753,7 @@ class MultimodalTransferLearning:
                     caption = caption.lower().replace(prompt_text.lower(), "").strip()
                 batch_captions_clean.append(caption.strip())
             
-            captions.extend(captions)
+            captions.extend(batch_captions_clean)
 
         return captions
 
