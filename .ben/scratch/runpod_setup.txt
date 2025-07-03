@@ -1,0 +1,46 @@
+follow gpu set up notes
+
+Then to Download qwen on remote:
+1. add my tokens to .env:
+WANDB_API_KEY=''
+HUGGINGFACE_HUB_TOKEN=''
+
+(doesnt work) so run:
+export HF_HUB_TOKEN=
+
+Then download qwen:
+python3 - << 'EOF'
+import os
+from transformers import AutoModelForVision2Seq, AutoProcessor
+
+token = os.environ["HF_HUB_TOKEN"]
+
+model = AutoModelForVision2Seq.from_pretrained(
+    "Qwen/Qwen2.5-VL-3B-Instruct",
+    token=token
+)
+processor = AutoProcessor.from_pretrained(
+    "Qwen/Qwen2.5-VL-3B-Instruct",
+    token=token
+)
+model.save_pretrained("models/Qwen2.5-VL-3B-Instruct")
+processor.save_pretrained("models/Qwen2.5-VL-3B-Instruct")
+EOF
+
+
+### Then install pip stuff to do the gdrive stuff:
+python3 -m ensurepip --upgrade
+python3 -m pip install --upgrade pip setuptools wheel
+pip install gdown
+pip install accelerate
+python -m pip install qwen-vl-utils==0.0.8
+
+
+# now copy mars data over:
+rsync -av --progress \
+  /media/bwilliams/New\ Volume1/mars_hackathon/zipped/dataset_part*.zip \
+  root@213.144.200.240:/root/MLX8-W4-Multimodal-TransferLearning/.ben/data/raw_reef_data/images/
+
+
+
+
