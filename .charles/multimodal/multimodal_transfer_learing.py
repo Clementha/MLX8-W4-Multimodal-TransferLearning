@@ -76,6 +76,9 @@ TRAINING_DATASET: str = os.getenv("TRAINING_DATASET", "flickr30k")
 WANDB_ENTITY: str = os.getenv("WANDB_ENTITY", "charles-cai")
 WANDB_PROJECT: str = os.getenv("WANDB_PROJECT", "mlx8-w4-multimodal-transferlearning")
 
+# Inference settings
+INFERENCE_PROMPT: str = os.getenv("INFERENCE_PROMPT", "Please describe the image in details")
+
 # ---------------------------------------------------------------------------- #
 
 ###############################################################################
@@ -104,9 +107,9 @@ log = logging.getLogger("MMTL")
 ###############################################################################
 
 class ImageAdapter(nn.Module):
-    """Two‑layer MLP that maps CLS / image_embeds → Qwen hidden dim (4 096)."""
+    """Two‑layer MLP that maps CLS / image_embeds → Qwen hidden dim (dynamic based on model config)."""
 
-    def __init__(self, in_dim: int, out_dim: int = 4096, hidden: int = 1024, n_tokens: int = 16):
+    def __init__(self, in_dim: int, out_dim: int = 1024, hidden: int = 1024, n_tokens: int = 16):
         super().__init__()
         self.n_tokens = n_tokens
         self.out_dim = out_dim
@@ -130,6 +133,7 @@ class MultimodalTransferLearning:
         - embedding: Only vision encoder needed
         - train: Only Qwen + bridge needed  
         - test: Only Qwen + bridge needed
+        - run: Load all components for inference
         """
         self.mode = mode
         self._set_seed(SEED)
@@ -148,8 +152,8 @@ class MultimodalTransferLearning:
             log.info(f"🔄 {mode.title()} mode: Initializing Qwen + bridge...")
             self._init_wandb()
             self._init_qwen()
-            log.info(f"🔧 Creating ImageAdapter: in_dim={IMG_EMB_DIM}, vision_encoder={VISION_ENCODER}")
-            self.bridge = ImageAdapter(IMG_EMB_DIM).to(self.device)
+            log.info(f"🔧 Creating ImageAdapter: in_dim={IMG_EMB_DIM} -> out_dim={self.qwen_hidden_size}")
+            self.bridge = ImageAdapter(IMG_EMB_DIM, out_dim=self.qwen_hidden_size).to(self.device)
             self._load_cached_embeddings()
             self._prepare_data()
             
@@ -158,8 +162,17 @@ class MultimodalTransferLearning:
                 log.info("🚀 Training setup complete!")
             else:
                 log.info("🚀 Test setup complete!")
+                
+        elif mode == "run":
+            log.info("🔄 Inference mode: Initializing all components...")
+            self._init_vision()
+            self._init_qwen()
+            log.info(f"🔧 Creating ImageAdapter: in_dim={IMG_EMB_DIM} -> out_dim={self.qwen_hidden_size}")
+            self.bridge = ImageAdapter(IMG_EMB_DIM, out_dim=self.qwen_hidden_size).to(self.device)
+            self._load_latest_checkpoint()
+            log.info("🚀 Inference setup complete!")
         else:
-            raise ValueError(f"Invalid mode: {mode}. Use 'embedding', 'train', or 'test'")
+            raise ValueError(f"Invalid mode: {mode}. Use 'embedding', 'train', 'test', or 'run'")
 
     # --------------------------------------------------------------------- #
     def _set_seed(self, seed: int):
@@ -215,9 +228,28 @@ class MultimodalTransferLearning:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B-Base")
+        
+        # Set pad_token if not set to avoid attention mask warnings
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            
         self.qwen = AutoModelForCausalLM.from_pretrained(
             "Qwen/Qwen3-0.6B-Base", torch_dtype="auto", #attn_implementation="flash_attention_2"
         ).to(self.device)
+        
+        # Get actual Qwen hidden size and log detailed info
+        self.qwen_hidden_size = self.qwen.config.hidden_size
+        self.qwen_dtype = next(self.qwen.parameters()).dtype  # Store Qwen's dtype
+        embed_tokens = self.qwen.get_input_embeddings()
+        
+        log.info(f"🔧 Qwen model dimensions:")
+        log.info(f"  Hidden size: {self.qwen_hidden_size}")
+        log.info(f"  Embedding dim: {embed_tokens.embedding_dim}")
+        log.info(f"  Vocab size: {self.qwen.config.vocab_size}")
+        log.info(f"  Dtype: {self.qwen_dtype}")
+        log.info(f"  Pad token: {self.tokenizer.pad_token}")
+        log.info(f"  Dimensions match: {embed_tokens.embedding_dim == self.qwen_hidden_size}")
+        
         self.qwen.eval().requires_grad_(False)
         if TOP_K > 0:
             # Hard fail if GPU likely insufficient — user responsibility.
@@ -403,10 +435,14 @@ class MultimodalTransferLearning:
         log.info("⏳ Setting up data loaders...")
         
         def preprocess(example):
-            # Tokenize caption
-            example["input_ids"] = self.tokenizer(
-                example["caption"], truncation=True, return_tensors="pt"
-            ).input_ids[0]
+            # Tokenize caption with proper padding token
+            tokens = self.tokenizer(
+                example["caption"], 
+                truncation=True, 
+                padding=False,  # Don't pad here, do it in collate_fn
+                return_tensors="pt"
+            )
+            example["input_ids"] = tokens.input_ids[0]
             return example
 
         # Custom collate function to handle variable-length sequences
@@ -418,19 +454,33 @@ class MultimodalTransferLearning:
             input_ids = [item["input_ids"] for item in batch]
             max_len = max(len(ids) for ids in input_ids)
             
-            # Pad sequences with tokenizer's pad_token_id
+            # Pad sequences and create attention masks
             padded_input_ids = []
+            attention_masks = []
+            
             for ids in input_ids:
+                # Create attention mask (1 for real tokens, 0 for padding)
+                attention_mask = torch.ones(len(ids), dtype=torch.long)
+                
                 if len(ids) < max_len:
-                    padding = torch.full((max_len - len(ids),), self.tokenizer.pad_token_id, dtype=ids.dtype)
+                    # Pad with pad_token_id
+                    padding_length = max_len - len(ids)
+                    padding = torch.full((padding_length,), self.tokenizer.pad_token_id, dtype=ids.dtype)
                     padded_ids = torch.cat([ids, padding])
+                    
+                    # Extend attention mask with zeros for padding
+                    padding_mask = torch.zeros(padding_length, dtype=torch.long)
+                    attention_mask = torch.cat([attention_mask, padding_mask])
                 else:
                     padded_ids = ids
+                    
                 padded_input_ids.append(padded_ids)
+                attention_masks.append(attention_mask)
             
             return {
                 "embedding": embeddings,
-                "input_ids": torch.stack(padded_input_ids)
+                "input_ids": torch.stack(padded_input_ids),
+                "attention_mask": torch.stack(attention_masks)
             }
 
         # Process datasets to add tokenized captions
@@ -506,25 +556,45 @@ class MultimodalTransferLearning:
         # Always use cached embedding (no vision encoder needed)
         img_emb = batch["embedding"].to(self.device)
         caption_ids = batch["input_ids"].to(self.device)
+        attention_mask = batch["attention_mask"].to(self.device)
         
-        # Bridge: img_emb (B, 768/512) -> vis_tokens (B, 16, 4096)
+        # Bridge: img_emb (B, 768/512) -> vis_tokens (B, 16, qwen_hidden_size)
         vis_tokens = self.bridge(img_emb)
+        # Convert to Qwen's dtype to avoid dtype mismatch
+        vis_tokens = vis_tokens.to(dtype=self.qwen_dtype)
         
-        # Text embeddings: caption_ids (B, seq_len) -> text_emb (B, seq_len, 4096)
+        # Text embeddings: caption_ids (B, seq_len) -> text_emb (B, seq_len, qwen_hidden_size)
         text_emb = self.qwen.get_input_embeddings()(caption_ids)
         
-        # Concatenate: inputs (B, 16+seq_len, 4096)
+        # Debug: Log shapes on first batch to verify dimensions
+        if not hasattr(self, '_logged_shapes'):
+            log.info(f"🔍 Forward pass dimensions:")
+            log.info(f"  img_emb: {img_emb.shape} ({img_emb.dtype})")
+            log.info(f"  vis_tokens: {vis_tokens.shape} ({vis_tokens.dtype})")
+            log.info(f"  text_emb: {text_emb.shape} ({text_emb.dtype})")
+            log.info(f"  attention_mask: {attention_mask.shape}")
+            self._logged_shapes = True
+        
+        # Concatenate: inputs (B, 16+seq_len, qwen_hidden_size)
         inputs = torch.cat([vis_tokens, text_emb], dim=1)
+        
+        # Create attention mask for visual + text tokens
+        batch_size, vis_seq_len = vis_tokens.shape[:2]
+        vis_attention = torch.ones((batch_size, vis_seq_len), device=self.device, dtype=attention_mask.dtype)
+        full_attention_mask = torch.cat([vis_attention, attention_mask], dim=1)
         
         # Create labels for loss calculation:
         # - Visual tokens get -100 (ignored in CrossEntropyLoss)
         # - Text tokens get their actual token IDs (used for loss)
-        batch_size, vis_seq_len = vis_tokens.shape[:2]
         vis_labels = torch.full((batch_size, vis_seq_len), -100, device=self.device)
         labels = torch.cat([vis_labels, caption_ids], dim=1)
         
         # Forward pass through Qwen:
-        outputs = self.qwen(inputs_embeds=inputs, labels=labels)
+        outputs = self.qwen(
+            inputs_embeds=inputs, 
+            attention_mask=full_attention_mask,
+            labels=labels
+        )
         return outputs.loss
 
     # --------------------------------------------------------------------- #
@@ -563,12 +633,36 @@ class MultimodalTransferLearning:
             if TOP_K > 0:
                 self.qwen.train()
             self.bridge.train()
+            
+            epoch_losses = []
             pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
-            for batch in pbar:
+            
+            for batch_idx, batch in enumerate(pbar):
                 loss = self._forward_step(batch)
+                epoch_losses.append(loss.item())
+                
                 loss.backward()
-                self.optimizer.step(); self.optimizer.zero_grad()
-                pbar.set_postfix(loss=f"{loss.item():.4f}")
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+                
+                # Update progress bar
+                avg_loss = sum(epoch_losses) / len(epoch_losses)
+                pbar.set_postfix(loss=f"{loss.item():.4f}", avg_loss=f"{avg_loss:.4f}")
+                
+                # Log batch loss to wandb
+                wandb.log({
+                    "train/batch_loss": loss.item(),
+                    "train/step": epoch * len(self.train_loader) + batch_idx
+                })
+            
+            # Log epoch metrics
+            epoch_avg_loss = sum(epoch_losses) / len(epoch_losses)
+            wandb.log({
+                "train/epoch_loss": epoch_avg_loss,
+                "epoch": epoch + 1
+            })
+            
+            log.info(f"📊 Epoch {epoch+1} complete - Average loss: {epoch_avg_loss:.4f}")
             
             # Eval after each epoch
             log.info(f"📊 Running evaluation after epoch {epoch+1}...")
@@ -590,24 +684,39 @@ class MultimodalTransferLearning:
         self.qwen.eval(); self.bridge.eval()
         loader = self.test_loader if test else self.eval_loader
         preds, refs = [], []
+        eval_losses = []
+        
         with torch.no_grad():
             for batch in loader:
-                # Always use cached embedding
+                # Calculate loss for evaluation
+                try:
+                    loss = self._forward_step(batch)
+                    eval_losses.append(loss.item())
+                except:
+                    pass  # Skip if evaluation loss fails
+                
+                # Generate predictions
                 img_emb = batch["embedding"].to(self.device)
                 vis_tokens = self.bridge(img_emb)
+                vis_tokens = vis_tokens.to(dtype=self.qwen_dtype)
                 
-                # Generate text tokens only (excluding visual embedding positions)
+                # Create attention mask for visual tokens
+                batch_size, vis_seq_len = vis_tokens.shape[:2]
+                vis_attention = torch.ones((batch_size, vis_seq_len), device=self.device)
+                
+                # Generate text tokens only
                 outputs = self.qwen.generate(
                     inputs_embeds=vis_tokens,
+                    attention_mask=vis_attention,
                     max_new_tokens=32,
                     do_sample=False,
-                    pad_token_id=self.tokenizer.eos_token_id,
+                    pad_token_id=self.tokenizer.pad_token_id,
                     return_dict_in_generate=True,
                     output_scores=False
                 )
                 
                 # Extract only the newly generated token IDs (skip visual token positions)
-                generated_ids = outputs.sequences[:, vis_tokens.shape[1]:]  # Skip visual tokens
+                generated_ids = outputs.sequences[:, vis_tokens.shape[1]:]
                 
                 # Decode predictions and references
                 batch_preds = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
@@ -621,6 +730,12 @@ class MultimodalTransferLearning:
         
         log_dict = {f"{tag}/{k}": v for k, v in metrics.items()}
         log_dict["epoch"] = epoch + 1
+        
+        # Add evaluation loss if available
+        if eval_losses:
+            avg_eval_loss = sum(eval_losses) / len(eval_losses)
+            log_dict[f"{tag}/loss"] = avg_eval_loss
+        
         wandb.log(log_dict)
         
         log.info(f"📊 {tag.title()} metrics at epoch {epoch+1}: {metrics}")
@@ -634,6 +749,109 @@ class MultimodalTransferLearning:
         }, fname)
         log.info(f"💾 Saved checkpoint → {fname}")
 
+    def _load_latest_checkpoint(self):
+        """Load the latest checkpoint for inference"""
+        checkpoint_files = list(OUTPUT_DIR_MODELS.glob(f"*_{VISION_ENCODER}_top{TOP_K}.pt"))
+        if not checkpoint_files:
+            log.error(f"❌ No checkpoints found in {OUTPUT_DIR_MODELS}")
+            raise FileNotFoundError(f"No checkpoints found for {VISION_ENCODER}_top{TOP_K}")
+        
+        # Sort by epoch number (assuming format: XX_encoder_topK.pt)
+        latest_checkpoint = sorted(checkpoint_files)[-1]
+        log.info(f"📁 Loading checkpoint: {latest_checkpoint}")
+        
+        checkpoint = torch.load(latest_checkpoint, map_location=self.device)
+        self.qwen.load_state_dict(checkpoint["qwen"])
+        self.bridge.load_state_dict(checkpoint["bridge"])
+        
+        self.qwen.eval()
+        self.bridge.eval()
+        log.info("✅ Checkpoint loaded successfully")
+
+    def _encode_images_batch(self, image_paths: List[str]) -> torch.Tensor:
+        """Encode a batch of images to embeddings"""
+        log.info(f"🖼️ Processing {len(image_paths)} images...")
+        
+        # Load images
+        from PIL import Image
+        images = []
+        for path in image_paths:
+            try:
+                img = Image.open(path).convert("RGB")
+                images.append(img)
+            except Exception as e:
+                log.error(f"❌ Failed to load {path}: {e}")
+                raise
+        
+        # Process in batches for efficiency
+        batch_size = 16 if self.device.type == "cuda" else 4
+        embeddings = []
+        
+        for i in range(0, len(images), batch_size):
+            batch_images = images[i:i+batch_size]
+            
+            # Process batch
+            if VISION_ENCODER == "vit":
+                batch_pixels = self.processor(images=batch_images, return_tensors="pt").pixel_values
+            else:
+                batch_pixels = self.processor(images=batch_images, return_tensors="pt").pixel_values
+            
+            batch_pixels = batch_pixels.to(self.device)
+            
+            # Generate embeddings
+            with torch.no_grad():
+                if VISION_ENCODER == "vit":
+                    batch_embeddings = self.vision_encoder(batch_pixels)[0][:, 0]  # CLS token
+                else:
+                    batch_embeddings = self.vision_encoder.get_image_features(pixel_values=batch_pixels)
+            
+            embeddings.extend(batch_embeddings.cpu())
+        
+        return torch.stack(embeddings)
+
+    def run_inference(self, image_paths: List[str]) -> List[str]:
+        """Run inference on a batch of images"""
+        log.info(f"🔮 Running inference on {len(image_paths)} images...")
+        
+        # Encode images
+        img_embeddings = self._encode_images_batch(image_paths)
+        img_embeddings = img_embeddings.to(self.device)
+        
+        # Generate captions
+        captions = []
+        batch_size = BATCH_SIZE
+        
+        for i in range(0, len(img_embeddings), batch_size):
+            batch_embeddings = img_embeddings[i:i+batch_size]
+            
+            # Bridge: img_emb -> vis_tokens
+            vis_tokens = self.bridge(batch_embeddings)
+            vis_tokens = vis_tokens.to(dtype=self.qwen_dtype)
+            
+            # Create attention mask for visual tokens
+            batch_size_actual, vis_seq_len = vis_tokens.shape[:2]
+            vis_attention = torch.ones((batch_size_actual, vis_seq_len), device=self.device)
+            
+            # Generate captions
+            with torch.no_grad():
+                outputs = self.qwen.generate(
+                    inputs_embeds=vis_tokens,
+                    attention_mask=vis_attention,
+                    max_new_tokens=64,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.9,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    return_dict_in_generate=True
+                )
+            
+            # Decode generated captions (skip visual token positions)
+            generated_ids = outputs.sequences[:, vis_tokens.shape[1]:]
+            batch_captions = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+            captions.extend(batch_captions)
+        
+        return captions
+
 ###############################################################################
 # 6.  CLI entry‑point                                                        #
 ###############################################################################
@@ -644,6 +862,7 @@ def parse_args():
     group.add_argument("--embedding", action="store_true", help="Generate and cache vision embeddings")
     group.add_argument("--train", action="store_true", help="Train model using cached embeddings (includes final test)")
     group.add_argument("--test", action="store_true", help="Run standalone test evaluation using cached embeddings")
+    group.add_argument("--run", nargs="+", metavar="IMAGE", help="Run inference on images (e.g., --run image1.jpg image2.jpg)")
     return p.parse_args()
 
 def main():
@@ -661,8 +880,31 @@ def main():
         engine = MultimodalTransferLearning(mode="test")
         engine.test()
         log.info("✅ Evaluation complete!")
+    elif args.run:
+        log.info(f"🔄 Mode: Inference on {len(args.run)} images")
+        engine = MultimodalTransferLearning(mode="run")
+        
+        # Validate image paths
+        valid_paths = []
+        for path in args.run:
+            if os.path.exists(path):
+                valid_paths.append(path)
+            else:
+                log.warning(f"⚠️ Image not found: {path}")
+        
+        if not valid_paths:
+            log.error("❌ No valid images found")
+            return
+        
+        # Run inference
+        captions = engine.run_inference(valid_paths)
+        
+        # Display results
+        log.info("🎯 Inference Results:")
+        for path, caption in zip(valid_paths, captions):
+            log.info(f"📸 {os.path.basename(path)}: {caption}")
     else:
-        log.error("❌ Must specify either --embedding, --train, or --test")
+        log.error("❌ Must specify --embedding, --train, --test, or --run")
 
 if __name__ == "__main__":
     main()

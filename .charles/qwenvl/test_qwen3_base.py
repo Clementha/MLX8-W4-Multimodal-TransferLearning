@@ -36,25 +36,37 @@ def test_qwen3_base_model():
             trust_remote_code=True  # May be needed for Qwen models
         )
         
-        # model = AutoModelForCausalLM.from_pretrained(
-        #     MODEL_NAME,
-        #     torch_dtype=torch.bfloat16,
-        #     device_map="auto",
-        #     attn_implementation="eager",
-        #     trust_remote_code=True  # May be needed for Qwen models
-        # )
-
-        prompt = "Why the sky is blue?" # "In one sentence, what is the capital of France?" # hello, who are you?" #
+        # Inspect model dimensions
+        print("\n=== Qwen Model Architecture Analysis ===")
+        print(f"Model config:")
+        print(f"  Hidden size: {model.config.hidden_size}")
+        print(f"  Vocab size: {model.config.vocab_size}")
+        print(f"  Number of layers: {model.config.num_hidden_layers}")
+        print(f"  Number of attention heads: {model.config.num_attention_heads}")
+        
+        # Check embedding dimensions
+        embed_tokens = model.get_input_embeddings()
+        print(f"\nEmbedding layer:")
+        print(f"  Embedding dim: {embed_tokens.embedding_dim}")
+        print(f"  Num embeddings: {embed_tokens.num_embeddings}")
+        print(f"  Weight shape: {embed_tokens.weight.shape}")
+        
+        # Test token embedding vs hidden size
+        test_tokens = torch.tensor([[1, 2, 3]]).to(model.device)
+        token_embeds = embed_tokens(test_tokens)
+        print(f"\nToken embedding test:")
+        print(f"  Input tokens shape: {test_tokens.shape}")
+        print(f"  Output embeddings shape: {token_embeds.shape}")
+        print(f"  Embedding dimension matches hidden size: {token_embeds.shape[-1] == model.config.hidden_size}")
+        
+        prompt = "Why the sky is blue?"
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
         
         with torch.no_grad():
             out_ids = model.generate(**inputs, max_new_tokens=2048)
             result = tokenizer.decode(out_ids[0], skip_special_tokens=True)
             
-        #assert len(result) > len(prompt)
-        #assert "France" in result or "Paris" in result
-        
-        print(result)
+        print(f"\nGeneration result:\n{result}")
     except ImportError as e:
         pytest.skip(f"Flash attention dependency issue: {e}")
 
