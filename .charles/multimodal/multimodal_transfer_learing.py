@@ -77,7 +77,9 @@ WANDB_ENTITY: str = os.getenv("WANDB_ENTITY", "charles-cai")
 WANDB_PROJECT: str = os.getenv("WANDB_PROJECT", "mlx8-w4-multimodal-transferlearning")
 
 # Inference settings
-INFERENCE_PROMPT: str = os.getenv("Examine the image carefully and provide a detailed description covering objects, people, actions, background, and any notable visual elements")
+INFERENCE_PROMPT: str = os.getenv("INFERENCE_PROMPT", "Examine the image carefully and provide a detailed description covering objects, people, actions, background, and any notable visual elements")
+
+BATCH_SAMPLING: int = int(os.getenv("BATCH_SAMPLING", "200"))  # Convert to int for proper usage
 
 # ---------------------------------------------------------------------------- #
 
@@ -107,15 +109,27 @@ log = logging.getLogger("MMTL")
 ###############################################################################
 
 class ImageAdapter(nn.Module):
-    """Two‑layer MLP that maps CLS / image_embeds → Qwen hidden dim (dynamic based on model config)."""
+    """Two‑layer MLP that maps CLS / image_embeds → Qwen hidden dim with cross-entropy option."""
 
-    def __init__(self, in_dim: int, out_dim: int = 1024, hidden: int = 1024, n_tokens: int = 16):
+    def __init__(self, in_dim: int, out_dim: int = 1024, hidden: int = 1024, n_tokens: int = 16, use_cross_entropy: bool = False):
         super().__init__()
         self.n_tokens = n_tokens
         self.out_dim = out_dim
-        self.mapper = nn.Sequential(
-            nn.Linear(in_dim, hidden), nn.Tanh(), nn.Linear(hidden, n_tokens * out_dim)
-        )
+        self.use_cross_entropy = use_cross_entropy
+        
+        if use_cross_entropy:
+            # Alternative: predict discrete tokens directly
+            self.mapper = nn.Sequential(
+                nn.Linear(in_dim, hidden), 
+                nn.Tanh(), 
+                nn.Linear(hidden, n_tokens * out_dim),
+                nn.Softmax(dim=-1)
+            )
+        else:
+            # Current approach: continuous embeddings
+            self.mapper = nn.Sequential(
+                nn.Linear(in_dim, hidden), nn.Tanh(), nn.Linear(hidden, n_tokens * out_dim)
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, in_dim)  → (B, n_tokens, out_dim)
@@ -153,7 +167,9 @@ class MultimodalTransferLearning:
             self._init_wandb()
             self._init_qwen()
             log.info(f"🔧 Creating ImageAdapter: in_dim={IMG_EMB_DIM} -> out_dim={self.qwen_hidden_size}")
-            self.bridge = ImageAdapter(IMG_EMB_DIM, out_dim=self.qwen_hidden_size).to(self.device)
+            # Add cross-entropy option for bridge
+            use_cross_entropy = os.getenv("BRIDGE_CROSS_ENTROPY", "false").lower() == "true"
+            self.bridge = ImageAdapter(IMG_EMB_DIM, out_dim=self.qwen_hidden_size, use_cross_entropy=use_cross_entropy).to(self.device)
             self._load_cached_embeddings()
             self._prepare_data()
             
@@ -168,7 +184,8 @@ class MultimodalTransferLearning:
             self._init_vision()
             self._init_qwen()
             log.info(f"🔧 Creating ImageAdapter: in_dim={IMG_EMB_DIM} -> out_dim={self.qwen_hidden_size}")
-            self.bridge = ImageAdapter(IMG_EMB_DIM, out_dim=self.qwen_hidden_size).to(self.device)
+            use_cross_entropy = os.getenv("BRIDGE_CROSS_ENTROPY", "false").lower() == "true"
+            self.bridge = ImageAdapter(IMG_EMB_DIM, out_dim=self.qwen_hidden_size, use_cross_entropy=use_cross_entropy).to(self.device)
             self._load_latest_checkpoint()
             log.info("🚀 Inference setup complete!")
         else:
@@ -229,13 +246,20 @@ class MultimodalTransferLearning:
         
         self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B-Base")
         
-        # Set pad_token if not set to avoid attention mask warnings
+        # Fix pad_token issue: Use a different token than eos_token
         if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-            
+            # Add a new pad token instead of using eos_token
+            self.tokenizer.add_special_tokens({'pad_token': '<|pad|>'})
+            log.info(f"🔧 Added new pad token: {self.tokenizer.pad_token}")
+        
         self.qwen = AutoModelForCausalLM.from_pretrained(
-            "Qwen/Qwen3-0.6B-Base", torch_dtype="auto", #attn_implementation="flash_attention_2"
+            "Qwen/Qwen3-0.6B-Base", torch_dtype="auto"
         ).to(self.device)
+        
+        # Resize token embeddings to accommodate new pad token
+        if self.tokenizer.pad_token != self.tokenizer.eos_token:
+            self.qwen.resize_token_embeddings(len(self.tokenizer))
+            log.info(f"🔧 Resized token embeddings to {len(self.tokenizer)}")
         
         # Get actual Qwen hidden size and log detailed info
         self.qwen_hidden_size = self.qwen.config.hidden_size
@@ -247,7 +271,9 @@ class MultimodalTransferLearning:
         log.info(f"  Embedding dim: {embed_tokens.embedding_dim}")
         log.info(f"  Vocab size: {self.qwen.config.vocab_size}")
         log.info(f"  Dtype: {self.qwen_dtype}")
-        log.info(f"  Pad token: {self.tokenizer.pad_token}")
+        log.info(f"  Pad token: '{self.tokenizer.pad_token}' (ID: {self.tokenizer.pad_token_id})")
+        log.info(f"  EOS token: '{self.tokenizer.eos_token}' (ID: {self.tokenizer.eos_token_id})")
+        log.info(f"  Tokens are different: {self.tokenizer.pad_token_id != self.tokenizer.eos_token_id}")
         log.info(f"  Dimensions match: {embed_tokens.embedding_dim == self.qwen_hidden_size}")
         
         self.qwen.eval().requires_grad_(False)
@@ -435,20 +461,25 @@ class MultimodalTransferLearning:
         log.info("⏳ Setting up data loaders...")
         
         def preprocess(example):
-            # Tokenize caption with proper padding token
+            # For training: tokenize just the caption (no prompt)
+            # This ensures the model learns to generate clean captions
             tokens = self.tokenizer(
-                example["caption"], 
+                example['caption'], 
                 truncation=True, 
-                padding=False,  # Don't pad here, do it in collate_fn
+                padding=False,
                 return_tensors="pt"
             )
             example["input_ids"] = tokens.input_ids[0]
+            example["original_caption"] = example["caption"]
             return example
 
         # Custom collate function to handle variable-length sequences
         def collate_fn(batch):
             # Stack embeddings (these are all the same size)
             embeddings = torch.stack([item["embedding"] for item in batch])
+            
+            # Collect original captions
+            original_captions = [item["original_caption"] for item in batch]
             
             # Pad input_ids to the same length within the batch
             input_ids = [item["input_ids"] for item in batch]
@@ -480,11 +511,12 @@ class MultimodalTransferLearning:
             return {
                 "embedding": embeddings,
                 "input_ids": torch.stack(padded_input_ids),
-                "attention_mask": torch.stack(attention_masks)
+                "attention_mask": torch.stack(attention_masks),
+                "original_caption": original_captions
             }
 
         # Process datasets to add tokenized captions
-        log.info("Tokenizing captions...")
+        log.info("Tokenizing captions with prompts...")
         self.dataset["train"] = self.dataset["train"].map(
             preprocess, 
             remove_columns=["caption"],
@@ -600,7 +632,7 @@ class MultimodalTransferLearning:
     # --------------------------------------------------------------------- #
     def _compute_metrics(self, preds: List[str], refs: List[str]) -> Dict[str, float]:
         if not preds or not refs:
-            return dict(BLEU4=0.0, CIDEr=0.0, R1=0.0, R5=0.0, P1=0.0, P5=0.0)
+            return dict(BLEU4=0.0, CIDEr=0.0, SPICE=0.0, ROUGE_L=0.0)
         
         # Clean predictions and references
         preds_clean = [pred.strip() for pred in preds if pred.strip()]
@@ -608,12 +640,40 @@ class MultimodalTransferLearning:
         
         if not preds_clean or not refs_clean or len(preds_clean) != len(refs_clean):
             log.warning(f"⚠️ Metrics issue: preds={len(preds_clean)}, refs={len(refs_clean)}")
-            return dict(BLEU4=0.0, CIDEr=0.0, R1=0.0, R5=0.0, P1=0.0, P5=0.0)
+            return dict(BLEU4=0.0, CIDEr=0.0, SPICE=0.0, ROUGE_L=0.0)
             
         try:
-            # Load BLEU and ROUGE metrics from evaluate
+            # Load metrics from evaluate
             bleu_metric = evaluate.load("bleu")
             rouge_metric = evaluate.load("rouge")
+            
+            # CIDEr and SPICE - need special handling
+            try:
+                from pycocoevalcap.cider.cider import Cider
+                from pycocoevalcap.spice.spice import Spice
+                
+                # Format for COCO eval (expects dict format)
+                gts = {i: [ref] for i, ref in enumerate(refs_clean)}
+                res = {i: [pred] for i, pred in enumerate(preds_clean)}
+                
+                cider_scorer = Cider()
+                spice_scorer = Spice()
+                
+                cider_score, _ = cider_scorer.compute_score(gts, res)
+                spice_score, _ = spice_scorer.compute_score(gts, res)
+                
+                cider = cider_score * 100  # Convert to percentage
+                spice = spice_score * 100
+                
+            except ImportError:
+                log.warning("⚠️ COCO eval tools not available, using approximations")
+                # Fallback: use sentence similarity as proxy
+                cider = 0.0
+                spice = 0.0
+            except Exception as e:
+                log.warning(f"⚠️ CIDEr/SPICE computation failed: {e}")
+                cider = 0.0
+                spice = 0.0
 
             # Convert single strings to lists of references as expected by evaluate
             bleu_refs = [[ref] for ref in refs_clean]
@@ -624,20 +684,101 @@ class MultimodalTransferLearning:
             bleu = bleu_result["bleu"] * 100  # Convert to percentage
             rouge_l = rouge_result["rougeL"] * 100 # Convert to percentage
 
-            log.info(f"📊 Metrics calculation: {len(preds_clean)} pairs, BLEU={bleu:.2f}, ROUGE-L={rouge_l:.2f}")
+            log.info(f"📊 Metrics: BLEU={bleu:.2f}, CIDEr={cider:.2f}, SPICE={spice:.2f}, ROUGE-L={rouge_l:.2f}")
         except Exception as e:
             log.warning(f"⚠️ Metrics computation failed: {e}")
-            bleu = 0.0
-            rouge_l = 0.0
+            bleu = cider = spice = rouge_l = 0.0
             
-        # Return metrics with better names
         return dict(
             BLEU4=bleu, 
+            CIDEr=cider,
+            SPICE=spice,
             ROUGE_L=rouge_l, 
             Samples=len(preds_clean)
         )
 
-    # --------------------------------------------------------------------- #
+    def _compute_lightweight_metrics(self, preds: List[str], refs: List[str]) -> Dict[str, float]:
+        """Compute lightweight metrics suitable for frequent batch-level evaluation"""
+        if not preds or not refs:
+            return dict(avg_length=0.0, non_empty_ratio=0.0, sample_count=0)
+        
+        # Clean predictions and references
+        preds_clean = [pred.strip() for pred in preds if pred.strip()]
+        refs_clean = [ref.strip() for ref in refs if ref.strip()]
+        
+        if not preds_clean or not refs_clean:
+            return dict(avg_length=0.0, non_empty_ratio=0.0, sample_count=0)
+        
+        # Lightweight metrics that don't require heavy computation
+        avg_pred_length = sum(len(pred.split()) for pred in preds_clean) / len(preds_clean)
+        avg_ref_length = sum(len(ref.split()) for ref in refs_clean) / len(refs_clean)
+        non_empty_ratio = len(preds_clean) / len(preds) if preds else 0.0
+        
+        # Simple word overlap as a proxy for quality (much faster than BLEU)
+        word_overlaps = []
+        for pred, ref in zip(preds_clean, refs_clean):
+            pred_words = set(pred.lower().split())
+            ref_words = set(ref.lower().split())
+            if ref_words:
+                overlap = len(pred_words.intersection(ref_words)) / len(ref_words)
+                word_overlaps.append(overlap)
+        
+        avg_word_overlap = sum(word_overlaps) / len(word_overlaps) if word_overlaps else 0.0
+        
+        return dict(
+            avg_pred_length=avg_pred_length,
+            avg_ref_length=avg_ref_length,
+            length_ratio=avg_pred_length / avg_ref_length if avg_ref_length > 0 else 0.0,
+            non_empty_ratio=non_empty_ratio * 100,  # Convert to percentage
+            word_overlap=avg_word_overlap * 100,  # Convert to percentage
+            sample_count=len(preds_clean)
+        )
+
+    def _generate_sample_during_training(self, batch, num_samples: int = 3):
+        """Generate sample captions during training for debugging"""
+        self.qwen.eval()
+        self.bridge.eval()
+        
+        with torch.no_grad():
+            # Take first few samples from batch
+            sample_embeddings = batch["embedding"][:num_samples].to(self.device)
+            
+            # Get original captions for reference
+            sample_refs = []
+            if "original_caption" in batch:
+                for i in range(min(num_samples, len(batch["original_caption"]))):
+                    sample_refs.append(batch["original_caption"][i])
+            else:
+                # Fallback: decode from input_ids (no prompt removal needed now)
+                sample_input_ids = batch["input_ids"][:num_samples]
+                for ids in sample_input_ids:
+                    decoded = self.tokenizer.decode(ids, skip_special_tokens=True)
+                    sample_refs.append(decoded)
+            
+            # Generate captions using full generation pipeline
+            sample_preds = self._generate_captions_from_embeddings(sample_embeddings, max_new_tokens=30)
+            
+            # Compute lightweight metrics for this sample
+            sample_metrics = self._compute_lightweight_metrics(sample_preds, sample_refs)
+            
+            log.info("📝 Training samples:")
+            for i, (pred, ref) in enumerate(zip(sample_preds, sample_refs)):
+                log.info(f"  Sample {i+1}:")
+                print(f"    \033[93mPred: {pred}\033[0m")  # Yellow
+                print(f"    \033[92mRef:  {ref}\033[0m")   # Green
+            
+            # Log sample metrics
+            log.info(f"📊 Sample metrics: len_ratio={sample_metrics['length_ratio']:.2f}, "
+                    f"word_overlap={sample_metrics['word_overlap']:.1f}%, "
+                    f"non_empty={sample_metrics['non_empty_ratio']:.1f}%")
+            
+            return sample_metrics
+        
+        # Return to training mode
+        if TOP_K > 0:
+            self.qwen.train()
+        self.bridge.train()
+
     def train(self):
         log.info(f"🏃 Starting training for {EPOCHS} epochs...")
         for epoch in range(EPOCHS):
@@ -661,6 +802,17 @@ class MultimodalTransferLearning:
                 avg_loss = sum(epoch_losses) / len(epoch_losses)
                 pbar.set_postfix(loss=f"{loss.item():.4f}", avg_loss=f"{avg_loss:.4f}")
                 
+                # Generate samples and compute lightweight metrics every BATCH_SAMPLING batches
+                if batch_idx % BATCH_SAMPLING == 0 and batch_idx > 0:
+                    log.info(f"🔍 Generating samples at batch {batch_idx}...")
+                    sample_metrics = self._generate_sample_during_training(batch, num_samples=2)
+                    
+                    # Log sample metrics to wandb with batch-level prefix
+                    wandb_sample_metrics = {f"train_sample/{k}": v for k, v in sample_metrics.items()}
+                    wandb_sample_metrics["train_sample/batch_idx"] = batch_idx
+                    wandb_sample_metrics["train_sample/epoch"] = epoch + 1
+                    wandb.log(wandb_sample_metrics)
+                
                 # Log batch loss to wandb
                 wandb.log({
                     "train/batch_loss": loss.item(),
@@ -676,7 +828,7 @@ class MultimodalTransferLearning:
             
             log.info(f"📊 Epoch {epoch+1} complete - Average loss: {epoch_avg_loss:.4f}")
             
-            # Eval after each epoch
+            # Eval after each epoch with samples
             log.info(f"📊 Running evaluation after epoch {epoch+1}...")
             self._evaluate(epoch)
             self._save_checkpoint(epoch)
@@ -695,7 +847,7 @@ class MultimodalTransferLearning:
     def _generate_captions_from_embeddings(self, img_embeddings: torch.Tensor, max_new_tokens: int = 50) -> List[str]:
         """Shared caption generation logic for both evaluation and inference"""
         captions = []
-        batch_size = BATCH_SIZE
+        batch_size = min(BATCH_SIZE, len(img_embeddings))
         
         for i in range(0, len(img_embeddings), batch_size):
             batch_embeddings = img_embeddings[i:i+batch_size]
@@ -704,8 +856,8 @@ class MultimodalTransferLearning:
             vis_tokens = self.bridge(batch_embeddings)
             vis_tokens = vis_tokens.to(dtype=self.qwen_dtype)
             
-            # Create prompt tokens: "Please describe the image in details:"
-            prompt_text = INFERENCE_PROMPT + ":"
+            # Create prompt tokens for inference consistency
+            prompt_text = INFERENCE_PROMPT
             prompt_tokens = self.tokenizer(
                 prompt_text, 
                 return_tensors="pt", 
@@ -717,136 +869,237 @@ class MultimodalTransferLearning:
             prompt_tokens = prompt_tokens.repeat(batch_size_actual, 1)
             prompt_emb = self.qwen.get_input_embeddings()(prompt_tokens)
             
-            # Concatenate: [visual_tokens, prompt_tokens]
-            full_inputs = torch.cat([vis_tokens, prompt_emb], dim=1)
+            # Add colon token after prompt
+            colon_token = self.tokenizer(":", return_tensors="pt", add_special_tokens=False).input_ids.to(self.device)
+            colon_token = colon_token.repeat(batch_size_actual, 1)
+            colon_emb = self.qwen.get_input_embeddings()(colon_token)
             
-            # Create attention mask for visual + prompt tokens
-            vis_seq_len = vis_tokens.shape[1]
-            prompt_seq_len = prompt_tokens.shape[1]
+            # Concatenate: [visual_tokens, prompt_tokens, colon_token]
+            full_inputs = torch.cat([vis_tokens, prompt_emb, colon_emb], dim=1)
+            
+            # Create attention mask
+            total_seq_len = full_inputs.shape[1]
             full_attention = torch.ones(
-                (batch_size_actual, vis_seq_len + prompt_seq_len), 
-                device=self.device
+                (batch_size_actual, total_seq_len), 
+                device=self.device,
+                dtype=torch.long
             )
             
-            # Generate captions
+            # Fixed generation parameters - avoid max_length/max_new_tokens conflict
             with torch.no_grad():
                 outputs = self.qwen.generate(
                     inputs_embeds=full_inputs,
                     attention_mask=full_attention,
-                    max_new_tokens=max_new_tokens,
+                    max_new_tokens=max_new_tokens,  # Only use max_new_tokens
+                    min_new_tokens=3,  # Reduced from 5 to be less restrictive
                     do_sample=True,
-                    temperature=0.7,
+                    temperature=0.8,  # Slightly higher for more diversity
                     top_p=0.9,
+                    top_k=50,  # Add top_k for better control
                     pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
                     return_dict_in_generate=True
                 )
             
-            # Extract only the newly generated token IDs (skip visual + prompt positions)
-            skip_len = vis_tokens.shape[1] + prompt_tokens.shape[1]
+            # Extract only the newly generated tokens
+            skip_len = total_seq_len
             generated_ids = outputs.sequences[:, skip_len:]
-            batch_captions = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
             
-            # Clean up captions (remove prompt if it leaked through)
-            batch_captions_clean = []
-            for caption in batch_captions:
-                if prompt_text.lower() in caption.lower():
-                    caption = caption.lower().replace(prompt_text.lower(), "").strip()
-                batch_captions_clean.append(caption.strip())
+            # Enhanced debug logging (only once)
+            if not hasattr(self, '_logged_generation'):
+                log.info(f"🔍 Generation debug:")
+                log.info(f"  Input length: {total_seq_len}")
+                log.info(f"  Output length: {outputs.sequences.shape[1]}")
+                log.info(f"  Generated tokens: {generated_ids.shape[1]}")
+                log.info(f"  Generation config: max_new_tokens={max_new_tokens}, min_new_tokens=3")
+                log.info(f"  Pad token ID: {self.tokenizer.pad_token_id}")
+                log.info(f"  EOS token ID: {self.tokenizer.eos_token_id}")
+                if generated_ids.shape[1] > 0:
+                    log.info(f"  First generated tokens: {generated_ids[0][:10].tolist()}")
+                self._logged_generation = True
+            
+            # Handle generation failure with better fallback
+            if generated_ids.numel() == 0 or outputs.sequences.shape[1] <= total_seq_len:
+                log.warning("⚠️ No new tokens generated, using simplified approach")
+                # Simplified generation: just visual tokens without prompt
+                simple_outputs = self.qwen.generate(
+                    inputs_embeds=vis_tokens,
+                    max_new_tokens=15,  # Shorter for better success rate
+                    min_new_tokens=1,   # Very permissive
+                    do_sample=True,
+                    temperature=1.0,    # More random for better generation
+                    top_p=0.95,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    return_dict_in_generate=True
+                )
+                simple_generated = simple_outputs.sequences[:, vis_tokens.shape[1]:]
+                
+                if simple_generated.numel() > 0:
+                    batch_captions = self.tokenizer.batch_decode(simple_generated, skip_special_tokens=True)
+                    batch_captions_clean = [f"[Fallback] {cap.strip()}" for cap in batch_captions if cap.strip()]
+                    # Fill in empty results
+                    while len(batch_captions_clean) < batch_size_actual:
+                        batch_captions_clean.append("[No generation]")
+                else:
+                    batch_captions_clean = ["[Generation failed]"] * batch_size_actual
+            else:
+                # Clean up generated captions
+                batch_captions = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+                batch_captions_clean = []
+                
+                for caption in batch_captions:
+                    # Clean and remove any prompt artifacts
+                    caption_clean = caption.strip()
+                    
+                    # Remove common prompt artifacts
+                    prompt_artifacts = [
+                        INFERENCE_PROMPT.lower(),
+                        "examine the image carefully",
+                        "provide a detailed description",
+                        "covering objects, people, actions"
+                    ]
+                    
+                    for artifact in prompt_artifacts:
+                        if artifact in caption_clean.lower():
+                            idx = caption_clean.lower().find(artifact)
+                            caption_clean = caption_clean[idx + len(artifact):].strip()
+                    
+                    # Remove leading punctuation
+                    while caption_clean and caption_clean[0] in ":.,!?- ":
+                        caption_clean = caption_clean[1:].strip()
+                    
+                    # Fallback for empty captions
+                    if not caption_clean:
+                        caption_clean = "[Empty generation]"
+                    
+                    batch_captions_clean.append(caption_clean)
             
             captions.extend(batch_captions_clean)
 
         return captions
 
-    # --------------------------------------------------------------------- #
-    def _evaluate(self, epoch: int, test: bool = False):
-        self.qwen.eval(); self.bridge.eval()
-        loader = self.test_loader if test else self.eval_loader
-        preds, refs = [], []
-        eval_losses = []
-        
-        # Add progress bar for evaluation
-        tag = "Test" if test else "Eval"
-        pbar = tqdm(loader, desc=f"{tag} evaluation")
-        
-        # Collect all embeddings for batch inference
-        all_embeddings = []
-        all_refs = []
-        
-        with torch.no_grad():
-            for batch in pbar:
-                # Calculate loss for evaluation
-                try:
-                    loss = self._forward_step(batch)
-                    eval_losses.append(loss.item())
-                    pbar.set_postfix(loss=f"{loss.item():.4f}")
-                except Exception as e:
-                    log.warning(f"⚠️ Evaluation loss failed: {e}")
-                
-                # Collect embeddings and references for batch inference
-                img_emb = batch["embedding"].to(self.device)
-                batch_refs = self.tokenizer.batch_decode(batch["input_ids"], skip_special_tokens=True)
-                
-                all_embeddings.append(img_emb)
-                all_refs.extend(batch_refs)
-        
-        # Generate all predictions using shared inference method
-        if all_embeddings:
-            all_embeddings_tensor = torch.cat(all_embeddings, dim=0)
-            preds = self._generate_captions_from_embeddings(all_embeddings_tensor, max_new_tokens=50)
-            refs = all_refs
-        
-        # Compute metrics
-        metrics = self._compute_metrics(preds, refs)
-        tag = "test" if test else "eval"
-        
-        log_dict = {f"{tag}/{k}": v for k, v in metrics.items()}
-        log_dict["epoch"] = epoch + 1
-        
-        # Add evaluation loss if available
-        if eval_losses:
-            avg_eval_loss = sum(eval_losses) / len(eval_losses)
-            log_dict[f"{tag}/loss"] = avg_eval_loss
-            log.info(f"📊 {tag.title()} loss: {avg_eval_loss:.4f}")
-        
-        wandb.log(log_dict)
-        
-        # Log sample predictions for debugging
-        if preds and refs:
-            log.info(f"📝 Sample {tag} predictions:")
-            for i in range(min(3, len(preds))):
-                log.info(f"  Pred: {preds[i]}")
-                log.info(f"  Ref:  {refs[i]}")
-                log.info("")
-        
-        log.info(f"📊 {tag.title()} metrics at epoch {epoch+1}: {metrics}")
-
-    # --------------------------------------------------------------------- #
+   # --------------------------------------------------------------------- #
     def _save_checkpoint(self, epoch: int):
-        fname = OUTPUT_DIR_MODELS / f"{epoch+1:02d}_{VISION_ENCODER}_top{TOP_K}.pt"
-        torch.save({
-            "qwen": self.qwen.state_dict(),
-            "bridge": self.bridge.state_dict(),
-        }, fname)
-        log.info(f"💾 Saved checkpoint → {fname}")
+        """Save checkpoint with proper metadata and validation"""
+        # Create filename with all relevant parameters
+        fname = OUTPUT_DIR_MODELS / f"{epoch+1:02d}_{VISION_ENCODER}_top{TOP_K}_{TRAINING_DATASET}.pt"
+        
+        # Prepare checkpoint data with metadata
+        checkpoint_data = {
+            "epoch": epoch + 1,
+            "qwen_state_dict": self.qwen.state_dict(),
+            "bridge_state_dict": self.bridge.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "config": {
+                "VISION_ENCODER": VISION_ENCODER,
+                "ENCODER_ID": ENCODER_ID,
+                "IMG_EMB_DIM": IMG_EMB_DIM,
+                "TOP_K": TOP_K,
+                "TRAINING_DATASET": TRAINING_DATASET,
+                "BATCH_SIZE": BATCH_SIZE,
+                "LR_ADAPTER": LR_ADAPTER,
+                "LR_QWEN": LR_QWEN,
+                "qwen_hidden_size": self.qwen_hidden_size,
+                "bridge_n_tokens": self.bridge.n_tokens,
+                "bridge_out_dim": self.bridge.out_dim,
+            },
+            "model_info": {
+                "qwen_trainable_params": sum(p.numel() for p in self.qwen.parameters() if p.requires_grad),
+                "bridge_trainable_params": sum(p.numel() for p in self.bridge.parameters() if p.requires_grad),
+                "total_trainable_params": sum(p.numel() for p in list(self.qwen.parameters()) + list(self.bridge.parameters()) if p.requires_grad),
+            }
+        }
+        
+        try:
+            torch.save(checkpoint_data, fname)
+            log.info(f"💾 Saved checkpoint → {fname}")
+            log.info(f"   Epoch: {epoch + 1}, TOP_K: {TOP_K}, Dataset: {TRAINING_DATASET}")
+            log.info(f"   Trainable params: {checkpoint_data['model_info']['total_trainable_params']:,}")
+        except Exception as e:
+            log.error(f"❌ Failed to save checkpoint: {e}")
+            raise
 
     def _load_latest_checkpoint(self):
-        """Load the latest checkpoint for inference"""
-        checkpoint_files = list(OUTPUT_DIR_MODELS.glob(f"*_{VISION_ENCODER}_top{TOP_K}.pt"))
+        """Load the latest checkpoint with comprehensive validation"""
+        # Pattern matching for current configuration
+        pattern = f"*_{VISION_ENCODER}_top{TOP_K}_{TRAINING_DATASET}.pt"
+        checkpoint_files = list(OUTPUT_DIR_MODELS.glob(pattern))
+        
+        # Fallback to older naming convention if no files found
+        if not checkpoint_files:
+            old_pattern = f"*_{VISION_ENCODER}_top{TOP_K}.pt"
+            checkpoint_files = list(OUTPUT_DIR_MODELS.glob(old_pattern))
+            if checkpoint_files:
+                log.warning(f"⚠️ Using old checkpoint naming convention: {old_pattern}")
+        
         if not checkpoint_files:
             log.error(f"❌ No checkpoints found in {OUTPUT_DIR_MODELS}")
-            raise FileNotFoundError(f"No checkpoints found for {VISION_ENCODER}_top{TOP_K}")
+            log.error(f"   Searched for: {pattern}")
+            log.error(f"   Available files: {list(OUTPUT_DIR_MODELS.glob('*.pt'))}")
+            raise FileNotFoundError(f"No checkpoints found for {VISION_ENCODER}_top{TOP_K}_{TRAINING_DATASET}")
         
-        # Sort by epoch number (assuming format: XX_encoder_topK.pt)
-        latest_checkpoint = sorted(checkpoint_files)[-1]
+        # Sort by epoch number (extract from filename)
+        def extract_epoch(fname):
+            try:
+                return int(fname.stem.split('_')[0])
+            except (ValueError, IndexError):
+                return 0
+        
+        latest_checkpoint = max(checkpoint_files, key=extract_epoch)
         log.info(f"📁 Loading checkpoint: {latest_checkpoint}")
         
-        checkpoint = torch.load(latest_checkpoint, map_location=self.device)
-        self.qwen.load_state_dict(checkpoint["qwen"])
-        self.bridge.load_state_dict(checkpoint["bridge"])
-        
-        self.qwen.eval()
-        self.bridge.eval()
-        log.info("✅ Checkpoint loaded successfully")
+        try:
+            checkpoint = torch.load(latest_checkpoint, map_location=self.device, weights_only=False)
+            
+            # Validate checkpoint structure
+            required_keys = ["qwen_state_dict", "bridge_state_dict"]
+            missing_keys = [key for key in required_keys if key not in checkpoint]
+            
+            if missing_keys:
+                # Handle old checkpoint format
+                if "qwen" in checkpoint and "bridge" in checkpoint:
+                    log.warning("⚠️ Loading old checkpoint format")
+                    self.qwen.load_state_dict(checkpoint["qwen"])
+                    self.bridge.load_state_dict(checkpoint["bridge"])
+                else:
+                    raise KeyError(f"Missing required keys in checkpoint: {missing_keys}")
+            else:
+                # Load new checkpoint format
+                self.qwen.load_state_dict(checkpoint["qwen_state_dict"])
+                self.bridge.load_state_dict(checkpoint["bridge_state_dict"])
+                
+                # Validate configuration if available
+                if "config" in checkpoint:
+                    config = checkpoint["config"]
+                    
+                    # Check critical configuration matches
+                    config_checks = [
+                        ("VISION_ENCODER", VISION_ENCODER),
+                        ("TOP_K", TOP_K),
+                        ("IMG_EMB_DIM", IMG_EMB_DIM),
+                        ("qwen_hidden_size", self.qwen_hidden_size),
+                    ]
+                    
+                    for key, expected in config_checks:
+                        if key in config and config[key] != expected:
+                            log.warning(f"⚠️ Config mismatch - {key}: checkpoint={config[key]}, current={expected}")
+                
+                # Log checkpoint info
+                if "model_info" in checkpoint:
+                    info = checkpoint["model_info"]
+                    log.info(f"   Trainable params: {info.get('total_trainable_params', 'unknown'):,}")
+                
+                if "epoch" in checkpoint:
+                    log.info(f"   Trained for: {checkpoint['epoch']} epochs")
+            
+            self.qwen.eval()
+            self.bridge.eval()
+            log.info("✅ Checkpoint loaded successfully")
+            
+        except Exception as e:
+            log.error(f"❌ Failed to load checkpoint {latest_checkpoint}: {e}")
+            raise
 
     def _encode_images_batch(self, image_paths: List[str]) -> torch.Tensor:
         """Encode a batch of images to embeddings"""
@@ -901,6 +1154,77 @@ class MultimodalTransferLearning:
         captions = self._generate_captions_from_embeddings(img_embeddings, max_new_tokens=64)
         
         return captions
+    
+    def _evaluate(self, epoch: int, test: bool = False):
+        """Evaluate model on eval/test set with full metrics"""
+        loader = self.test_loader if test else self.eval_loader
+        split_name = "test" if test else "eval"
+        
+        log.info(f"📊 Running {split_name} evaluation...")
+        
+        # Set to eval mode
+        self.qwen.eval()
+        self.bridge.eval()
+        
+        eval_losses = []
+        all_preds = []
+        all_refs = []
+        
+        with torch.no_grad():
+            for batch in tqdm(loader, desc=f"{split_name.title()} evaluation"):
+                # Compute loss
+                loss = self._forward_step(batch)
+                eval_losses.append(loss.item())
+                
+                # Generate captions for metrics
+                img_embeddings = batch["embedding"].to(self.device)
+                preds = self._generate_captions_from_embeddings(img_embeddings, max_new_tokens=50)
+                
+                # Get reference captions
+                if "original_caption" in batch:
+                    refs = batch["original_caption"]
+                else:
+                    # Decode from input_ids as fallback
+                    refs = []
+                    for ids in batch["input_ids"]:
+                        decoded = self.tokenizer.decode(ids, skip_special_tokens=True)
+                        refs.append(decoded)
+                
+                all_preds.extend(preds)
+                all_refs.extend(refs)
+        
+        # Compute metrics
+        avg_loss = sum(eval_losses) / len(eval_losses)
+        metrics = self._compute_metrics(all_preds, all_refs)
+        
+        # Log results
+        log.info(f"📊 {split_name.title()} Results:")
+        log.info(f"  Loss: {avg_loss:.4f}")
+        log.info(f"  BLEU-4: {metrics['BLEU4']:.2f}")
+        log.info(f"  CIDEr: {metrics['CIDEr']:.2f}")
+        log.info(f"  SPICE: {metrics['SPICE']:.2f}")
+        log.info(f"  ROUGE-L: {metrics['ROUGE_L']:.2f}")
+        
+        # Log to wandb
+        wandb_metrics = {f"{split_name}/{k.lower()}": v for k, v in metrics.items()}
+        wandb_metrics[f"{split_name}/loss"] = avg_loss
+        wandb_metrics["epoch"] = epoch + 1
+        wandb.log(wandb_metrics)
+        
+        # Show some sample predictions
+        log.info(f"📝 Sample {split_name} predictions:")
+        for i in range(min(3, len(all_preds))):
+            print(f"  Sample {i+1}:")
+            print(f"    \033[93mPred: {all_preds[i]}\033[0m")  # Yellow
+            print(f"    \033[92mRef:  {all_refs[i]}\033[0m")   # Green
+        
+        # Return to training mode if needed
+        if not test and TOP_K > 0:
+            self.qwen.train()
+        if not test:
+            self.bridge.train()
+        
+        return metrics
 
 ###############################################################################
 # 6.  CLI entry‑point                                                        #
