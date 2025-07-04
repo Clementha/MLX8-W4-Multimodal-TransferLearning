@@ -1147,7 +1147,7 @@ class MultimodalTransferLearning:
                             max_new_tokens=max_new_tokens,
                             min_new_tokens=1,
                             do_sample=True,
-                            temperature=0.8,
+                            temperature=0.1,
                             top_p=0.92,
                             top_k=50,
                             pad_token_id=self.tokenizer.pad_token_id,

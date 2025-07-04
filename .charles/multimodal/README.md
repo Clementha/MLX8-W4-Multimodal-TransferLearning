@@ -48,14 +48,14 @@ flowchart LR
     %% =========  ADAPTER  ========= %%
     VE -.-> BRIDGE
     altVE -.-> BRIDGE
-    BRIDGE[MLP Adapter<br/>in 512/768 → out N×4096<br/>trainable]:::train
+    BRIDGE[MLP Adapter<br/>in 512/768 → out N×1024<br/>trainable]:::train
     classDef train fill:#e8fff0,stroke:#22aa55,stroke-width:2px
 
     %% =========  QWEN DECODER  ========= %%
     BRIDGE -->|concat with prompt| QWEN
     subgraph QwenDecoder [Qwen-3-0.6B Decoder]
         direction TB
-        QWEN[28-layer GPT-style<br/>decoder d = 4096]:::frozen
+        QWEN[28-layer GPT-style<br/>decoder d = 1024]:::frozen
         TOPK[Top-K layers<br/>unfrozen K = 0–3]:::train
     end
     classDef frozen fill:#f0f4ff,stroke:#4466dd
@@ -115,23 +115,23 @@ flowchart TD
     CLIP --> |IMG_EMB_DIM=512| ADAPTER
     
     %% ImageAdapter (Trainable)
-    ADAPTER[ImageAdapter MLP<br/>2-layer Bridge<br/>768/512 → 16×4096<br/>🟢 Trainable]
+    ADAPTER[ImageAdapter MLP<br/>2-layer Bridge<br/>768/512 → 16×1024<br/>🟢 Trainable]
     
     %% Text Input
     TEXT_IN[Text Caption/Prompt] --> TOKENIZER[Qwen Tokenizer]
-    TOKENIZER --> TEXT_EMB[Text Embeddings<br/>seq_len × 4096]
+    TOKENIZER --> TEXT_EMB[Text Embeddings<br/>seq_len × 1024]
     
     %% Concatenation
     ADAPTER --> |16 Vision Tokens| CONCAT[Concatenate<br/>v1...v16, t1...tn]
     TEXT_EMB --> CONCAT
     
     %% Qwen Decoder
-    CONCAT --> QWEN_INPUT[Combined Sequence<br/>16+seq_len × 4096]
+    CONCAT --> QWEN_INPUT[Combined Sequence<br/>16+seq_len × 1024]
     
     subgraph QWEN [Qwen-3-0.6B Decoder]
         QWEN_INPUT --> FROZEN_LAYERS[Layers 0 to 24<br/>🔵 Frozen]
         FROZEN_LAYERS --> TRAINABLE_LAYERS[Top-K Layers 25-27<br/>🟢 Trainable<br/>K=0,1,2,3]
-        TRAINABLE_LAYERS --> LM_HEAD[LM Head<br/>4096 → vocab_size]
+        TRAINABLE_LAYERS --> LM_HEAD[LM Head<br/>1024 → vocab_size]
     end
     
     %% Output
@@ -160,7 +160,7 @@ Key Architecture Details:
 
 - Frozen Vision Encoder: Either ViT-B/16 (768-d CLS token) or CLIP ViT-B/32 (512-d image embedding)
 
-- Trainable ImageAdapter: 2-layer MLP that maps single image embedding → 16 vision tokens of 4096-d (Qwen's hidden size)
+- Trainable ImageAdapter: 2-layer MLP that maps single image embedding → 16 vision tokens of 1024-d (Qwen's hidden size)
 
 - Sequence Construction: [v1, v2, ..., v16, t1, t2, ..., tn] where vision tokens are prepended
 
@@ -173,7 +173,7 @@ Key Architecture Details:
 **Diagram key**
 
 * 🔵 **Frozen modules** – Vision encoder (ViT-B/16 *or* CLIP ViT-B/32) and most of Qwen’s 28 decoder blocks.
-* 🟢 **Trainable modules** – a two-layer MLP **Adapter** that maps the 768-d (ViT) or 512-d (CLIP) image vector into *N* pseudo-tokens of width 4096; plus the **top-K** Qwen blocks you choose to unfreeze (default K = 3, K = 0 means fully frozen).
+* 🟢 **Trainable modules** – a two-layer MLP **Adapter** that maps the 768-d (ViT) or 512-d (CLIP) image vector into *N* pseudo-tokens of width 1024; plus the **top-K** Qwen blocks you choose to unfreeze (default K = 3, K = 0 means fully frozen).
 
 **End-to-end flow**
 
