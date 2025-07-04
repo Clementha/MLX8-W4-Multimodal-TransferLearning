@@ -36,6 +36,7 @@ dependencies = [
     "torchmetrics",
     "colorlog>=6.9.0",
     "evaluate>=0.4.4",
+    "gradio>=5.35.0",
 ]
 
 #   "unsloth[cu121-ampere-torch230]",

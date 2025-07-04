@@ -1185,7 +1185,7 @@ class MultimodalTransferLearning:
                                 actual_input_length = 0  # No tokens to skip if no prompt
 
                         generated_ids = outputs.sequences[:, actual_input_length:]
-
+                        generated_ids = outputs.sequences[:, 0:]
                         
                         # Decode generated tokens
                         if generated_ids.numel() > 0 and generated_ids.shape[1] > 0:
@@ -1459,7 +1459,7 @@ class MultimodalTransferLearning:
                 
                 # Generate captions using shared method with inference prompt
                 img_embeddings = batch["embedding"].to(self.device)
-                preds = self._generate_captions_with_prompt(img_embeddings, prompt=INFERENCE_PROMPT, max_new_tokens=50)
+                preds = self._generate_captions_with_prompt(img_embeddings, prompt=INFERENCE_PROMPT, max_new_tokens=100)
                 
                 # Get reference captions (don't split for test/eval)
                 if "original_caption" in batch:
