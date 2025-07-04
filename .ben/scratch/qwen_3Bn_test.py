@@ -20,11 +20,10 @@ from qwen_vl_utils import process_vision_info
 
 # — your exact absolute paths —
 MODEL_DIR = Path(
-    "/root/MLX8-W4-Multimodal-TransferLearning/.ben/models/"
-    "Qwen2.5-VL-3B-Instruct"
+    "/.ben/models/Qwen2.5-VL-3B-Instruct"
 )
 IMAGE_PATH = Path(
-    "/root/MLX8-W4-Multimodal-TransferLearning/.ben/"
+    "/.ben/"
     "scratch/card_game.jpeg"
 )
 # ————————————————————————

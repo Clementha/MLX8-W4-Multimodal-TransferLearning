@@ -68,7 +68,7 @@ source .ben/pytorch_uv/bin/activate
 deactivate
 ```
 
-## 6. To add new 
+## 6. To add new dependancies
 Add the dependancy to the toml file.
 
 ```bash
@@ -102,21 +102,21 @@ python3 -m pip install accelerate --break-system-packages
 python3 -m pip install bitsandbytes --break-system-packages
 
 ```
+export HF_HUB_TOKEN='PUT TOKEN HERE'
+
 python3 - << 'EOF'
 import os
 from transformers import AutoModelForVision2Seq, AutoProcessor
 
 token = os.environ["HF_HUB_TOKEN"]
 
-SAVE_DIR = "models/Qwen2.5-VL-3B-Instruct-8bit"
+SAVE_DIR = "models/Qwen2.5-VL-3B-Instruct"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 model = AutoModelForVision2Seq.from_pretrained(
   "Qwen/Qwen2.5-VL-3B-Instruct",
   token=token,
-  device_map="cpu",
-  quantization_config={"load_in_8bit": True}
-)
+  device_map="cpu")
 
 processor = AutoProcessor.from_pretrained(
   "Qwen/Qwen2.5-VL-3B-Instruct",
