@@ -16,10 +16,10 @@
 GPT-4.1
 ```mermaid
 flowchart LR
-    A[Input Image] --> B[Vision Encoder<br/>(ViT-B/16 or CLIP ViT-B/32)<br/><i>Frozen</i>]
-    B -- CLS/Image Embedding --> C[2-layer MLP Adapter<br/>(Trainable)]
+    A[Input Image] --> B[Vision Encoder<br/>ViT-B/16 or CLIP ViT-B/32<br/>Frozen]
+    B -- CLS/Image Embedding --> C[2-layer MLP Adapter<br/>Trainable]
     C -- Visual Tokens --> D[Qwen 3-0.6B<br/>Language Model]
-    E[Input Caption<br/>(Tokenized)] --> F[Qwen Embedding Layer]
+    E[Input Caption<br/>Tokenized] --> F[Qwen Embedding Layer]
     F -- Text Tokens --> D
     D -- Output --> G[Caption Prediction<br/>or VQA Answer]
     subgraph Qwen 3-0.6B
@@ -34,51 +34,53 @@ Another version (GPT-o3)
 ```mermaid
 flowchart LR
     %% =========  INPUT  ========= %%
-    IMG[User-supplied Image] --> |224×224 RGB| PREP[Pre-processing<br>Resize · Center-crop · Norm];
+    IMG[User-supplied Image] --> |224×224 RGB| PREP[Pre-processing<br/>Resize · Center-crop · Norm]
 
     %% =========  VISION ENCODER  ========= %%
-    PREP --> VE;
-    subgraph Frozen Vision Encoder
+    PREP --> VE
+    subgraph FrozenVisionEncoder [Frozen Vision Encoder]
         direction TB
-        VE["Google **ViT-B/16**<br>(CLS 768-d)":::vit]:::box
-        altVE["OpenAI **CLIP ViT-B/32**<br>(image_emb 512-d)":::clip]:::box
+        VE[Google ViT-B/16<br/>CLS 768-d]:::vit
+        altVE[OpenAI CLIP ViT-B/32<br/>image_emb 512-d]:::clip
     end
-    classDef box stroke:#555,stroke-width:1px,fill:#fdfdfd;
+    classDef box stroke:#555,stroke-width:1px,fill:#fdfdfd
 
     %% =========  ADAPTER  ========= %%
-    VE -. chooses .-> BRIDGE;
-    altVE -. chooses .-> BRIDGE;
-    BRIDGE[**MLP Adapter**<br>in 512/768 → out N×4096<br>(*trainable*)]:::train;
-    classDef train fill:#e8fff0,stroke:#22aa55,stroke-width:2px;
+    VE -.-> BRIDGE
+    altVE -.-> BRIDGE
+    BRIDGE[MLP Adapter<br/>in 512/768 → out N×4096<br/>trainable]:::train
+    classDef train fill:#e8fff0,stroke:#22aa55,stroke-width:2px
 
     %% =========  QWEN DECODER  ========= %%
-    BRIDGE -->|concat with prompt| QWEN;
-    subgraph Qwen-3-0.6B Decoder
+    BRIDGE -->|concat with prompt| QWEN
+    subgraph QwenDecoder [Qwen-3-0.6B Decoder]
         direction TB
-        QWEN["28-layer GPT-style<br>decoder (d = 4096)"]:::frozen
-        TOPK{{Top-K layers<br>unfrozen (K = 0–3)}}:::train
+        QWEN[28-layer GPT-style<br/>decoder d = 4096]:::frozen
+        TOPK[Top-K layers<br/>unfrozen K = 0–3]:::train
     end
-    classDef frozen fill:#f0f4ff,stroke:#4466dd;
+    classDef frozen fill:#f0f4ff,stroke:#4466dd
 
-    QWEN --> TEXT[Text output<br>(caption / VQA answer)];
+    QWEN --> TEXT[Text output<br/>caption / VQA answer]
 
     %% =========  LEGEND  ========= %%
-    class IMG,PREP,VE,altVE,BRIDGE,QWEN,TEXT,TOPK default;
     subgraph Legend
         L1[🔵 Frozen weights]:::frozen
         L2[🟢 Trainable weights]:::train
     end
+    
+    classDef vit fill:#ffe6e6,stroke:#cc0000,stroke-width:2px
+    classDef clip fill:#e6f3ff,stroke:#0066cc,stroke-width:2px
 ```
 
 Friday version (GPT-4.1)
 ```mermaid
 graph TD
-    A[Input Image] -->|ViT/CLIP<br>Encoder| B[Image Embedding<br/>(768 or 512-dim)]
-    B -->|ImageAdapter<br>MLP| C[16 Vision Tokens<br/>(16 x Qwen hidden size)]
+    A[Input Image] -->|ViT/CLIP<br/>Encoder| B[Image Embedding<br/>768 or 512-dim]
+    B -->|ImageAdapter<br/>MLP| C[16 Vision Tokens<br/>16 x Qwen hidden size]
     D[Prompt/Text Caption] -->|Tokenizer| E[Text Tokens]
-    C -->|Concat| F[Sequence:<br/>[v1...v16, t1...tn]]
+    C -->|Concat| F[Sequence:<br/>v1...v16, t1...tn]
     E -->|Concat| F
-    F -->|Qwen-3-0.6B<br>Language Model| G[Output:<br/>Generated Caption]
+    F -->|Qwen-3-0.6B<br/>Language Model| G[Output:<br/>Generated Caption]
     
     style A fill:#f9f,stroke:#333,stroke-width:2px
     style D fill:#bbf,stroke:#333,stroke-width:2px
@@ -120,11 +122,11 @@ flowchart TD
     TOKENIZER --> TEXT_EMB[Text Embeddings<br/>seq_len × 4096]
     
     %% Concatenation
-    ADAPTER --> |16 Vision Tokens| CONCAT[Concatenate<br/>[v1...v16, t1...tn]]
+    ADAPTER --> |16 Vision Tokens| CONCAT[Concatenate<br/>v1...v16, t1...tn]
     TEXT_EMB --> CONCAT
     
     %% Qwen Decoder
-    CONCAT --> QWEN_INPUT[Combined Sequence<br/>(16+seq_len) × 4096]
+    CONCAT --> QWEN_INPUT[Combined Sequence<br/>16+seq_len × 4096]
     
     subgraph QWEN [Qwen-3-0.6B Decoder]
         QWEN_INPUT --> FROZEN_LAYERS[Layers 0 to 24<br/>🔵 Frozen]
