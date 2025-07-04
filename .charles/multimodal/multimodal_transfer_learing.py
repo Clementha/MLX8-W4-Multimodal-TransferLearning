@@ -42,6 +42,8 @@ import evaluate
 import logging
 import colorlog
 
+import random
+
 ###############################################################################
 # 1.  Environment variables — loaded once, accessible via `self.xxx`           #
 ###############################################################################
@@ -91,6 +93,13 @@ BATCH_SAMPLING: int = int(os.getenv("BATCH_SAMPLING", "200"))  # Convert to int 
 
 # Caption processing settings
 SPLIT_CAPTIONS: bool = os.getenv("SPLIT_CAPTIONS", "True").lower() == "true"
+
+# Training dataset limiting factor (1.0 = full dataset, 0.3 = 30% of dataset)
+LIMITING_FACTOR: float = float(os.getenv("LIMITING_FACTOR", "1.0"))
+
+# Eval and test dataset limiting factors
+LIMITING_FACTOR_EVAL: float = float(os.getenv("LIMITING_FACTOR_EVAL", "1.0"))
+LIMITING_FACTOR_TEST: float = float(os.getenv("LIMITING_FACTOR_TEST", "1.0"))
 
 PROMPT_VARIATION_POOL = [
     "Describe this image.",
@@ -655,11 +664,64 @@ class MultimodalTransferLearning:
         )
         
         self.dataset.set_format(type="torch")
+        
+        # Apply limiting factor to training dataset only
+        if LIMITING_FACTOR < 1.0:
+            original_train_size = len(self.dataset["train"])
+            limited_size = int(original_train_size * LIMITING_FACTOR)
+            
+            # Randomly sample a subset of training data
+            indices = list(range(original_train_size))
+            random.shuffle(indices)
+            selected_indices = indices[:limited_size]
+            
+            # Create limited training dataset
+            self.dataset["train"] = self.dataset["train"].select(selected_indices)
+            
+            log.info(f"🎯 Applied LIMITING_FACTOR={LIMITING_FACTOR}: {original_train_size} → {limited_size} training samples")
+        else:
+            log.info(f"📚 Using full training dataset: {len(self.dataset['train'])} samples")
+        
+        # Apply limiting factor to eval dataset
+        if LIMITING_FACTOR_EVAL < 1.0:
+            original_eval_size = len(self.dataset["eval"])
+            limited_eval_size = int(original_eval_size * LIMITING_FACTOR_EVAL)
+            
+            # Randomly sample a subset of eval data
+            eval_indices = list(range(original_eval_size))
+            random.shuffle(eval_indices)
+            selected_eval_indices = eval_indices[:limited_eval_size]
+            
+            # Create limited eval dataset
+            self.dataset["eval"] = self.dataset["eval"].select(selected_eval_indices)
+            
+            log.info(f"🎯 Applied LIMITING_FACTOR_EVAL={LIMITING_FACTOR_EVAL}: {original_eval_size} → {limited_eval_size} eval samples")
+        else:
+            log.info(f"📚 Using full eval dataset: {len(self.dataset['eval'])} samples")
+        
+        # Apply limiting factor to test dataset
+        if LIMITING_FACTOR_TEST < 1.0:
+            original_test_size = len(self.dataset["test"])
+            limited_test_size = int(original_test_size * LIMITING_FACTOR_TEST)
+            
+            # Randomly sample a subset of test data
+            test_indices = list(range(original_test_size))
+            random.shuffle(test_indices)
+            selected_test_indices = test_indices[:limited_test_size]
+            
+            # Create limited test dataset
+            self.dataset["test"] = self.dataset["test"].select(selected_test_indices)
+            
+            log.info(f"🎯 Applied LIMITING_FACTOR_TEST={LIMITING_FACTOR_TEST}: {original_test_size} → {limited_test_size} test samples")
+        else:
+            log.info(f"📚 Using full test dataset: {len(self.dataset['test'])} samples")
+        
         self.train_loader = DataLoader(self.dataset["train"], batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
         self.eval_loader = DataLoader(self.dataset["eval"], batch_size=BATCH_SIZE, collate_fn=collate_fn)
         self.test_loader = DataLoader(self.dataset["test"], batch_size=BATCH_SIZE, collate_fn=collate_fn)
         
         log.info("✅ Data loaders ready!")
+        log.info(f"📊 Final dataset sizes: train={len(self.dataset['train'])}, eval={len(self.dataset['eval'])}, test={len(self.dataset['test'])}")
 
     # --------------------------------------------------------------------- #
     def _init_optimisers(self):
@@ -878,7 +940,7 @@ class MultimodalTransferLearning:
                         sample_refs.append(decoded)
                 
                 # Generate captions with shorter max_new_tokens for training samples
-                sample_preds = self._generate_captions_with_prompt(sample_embeddings, prompt="", max_new_tokens=30)
+                sample_preds = self._generate_captions_with_prompt(sample_embeddings, prompt="", max_new_tokens=50)
                 
                 # Ensure we have the right number of predictions
                 while len(sample_preds) < len(sample_refs):
@@ -983,6 +1045,39 @@ class MultimodalTransferLearning:
         log.info("🎯 Training complete! Running final test evaluation...")
         self.test()
 
+    def _save_checkpoint(self, epoch: int):
+        """
+        Save a checkpoint containing the Qwen and bridge model states, along with config and metadata.
+        """
+        try:
+            # Compose checkpoint filename
+            filename = f"{epoch+1:02d}_{VISION_ENCODER}_top{TOP_K}_{TRAINING_DATASET}.pt"
+            checkpoint_path = OUTPUT_DIR_MODELS / filename
+
+            # Gather model state dicts
+            checkpoint = {
+                "epoch": epoch + 1,
+                "qwen_state_dict": self.qwen.state_dict(),
+                "bridge_state_dict": self.bridge.state_dict(),
+                "config": {
+                    "VISION_ENCODER": VISION_ENCODER,
+                    "TOP_K": TOP_K,
+                    "IMG_EMB_DIM": IMG_EMB_DIM,
+                    "TRAINING_DATASET": TRAINING_DATASET,
+                    "qwen_hidden_size": self.qwen_hidden_size,
+                },
+                "model_info": {
+                    "total_trainable_params": sum(p.numel() for p in list(self.qwen.parameters()) + list(self.bridge.parameters()) if p.requires_grad),
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            }
+
+            torch.save(checkpoint, checkpoint_path)
+            log.info(f"💾 Saved checkpoint: {checkpoint_path}")
+
+        except Exception as e:
+            log.error(f"❌ Failed to save checkpoint: {e}")
+
     def test(self):
         """Run final test evaluation"""
         log.info("🧪 Running test evaluation...")
@@ -990,7 +1085,7 @@ class MultimodalTransferLearning:
         log.info("✅ Test evaluation complete!")
 
     # --------------------------------------------------------------------- #
-    def _generate_captions_with_prompt(self, img_embeddings: torch.Tensor, prompt: str = None, max_new_tokens: int = 50) -> List[str]:
+    def _generate_captions_with_prompt(self, img_embeddings: torch.Tensor, prompt: str = None, max_new_tokens: int = 100) -> List[str]:
         """Shared caption generation logic with optional prompt"""
         captions = []
         batch_size = min(BATCH_SIZE, len(img_embeddings))
@@ -1032,10 +1127,16 @@ class MultimodalTransferLearning:
                     vis_seq_len = vis_tokens.shape[1]
                     vis_attention = torch.ones((batch_size_actual, vis_seq_len), device=self.device, dtype=prompt_tokens.attention_mask.dtype)
                     full_attention_mask = torch.cat([vis_attention, prompt_tokens.attention_mask], dim=1)
+
+                     # Skip only the prompt tokens (visual tokens are not in the sequence)
+                    skip_length = prompt_tokens.input_ids.shape[1]
                 else:
                     # Without prompt: visual tokens only
                     inputs = vis_tokens
                     full_attention_mask = torch.ones((batch_size_actual, vis_tokens.shape[1]), device=self.device, dtype=torch.long)
+    
+                    # No prompt to skip
+                    skip_length = 0
                 
                 with torch.no_grad():
                     try:
@@ -1059,7 +1160,32 @@ class MultimodalTransferLearning:
                         
                         # Extract generated tokens (skip input length)
                         input_length = inputs.shape[1]
-                        generated_ids = outputs.sequences[:, input_length:]
+                        generated_ids = outputs.sequences[:, skip_length:] #input_length:]
+
+                        actual_input_length = 0
+                        if outputs.sequences.shape[1] > 0:
+                            # Try to decode first few tokens to see what they are
+                            first_tokens = outputs.sequences[0, :min(20, outputs.sequences.shape[1])]
+                            decoded_first = self.tokenizer.decode(first_tokens, skip_special_tokens=True)
+                            print(f"DEBUG: First tokens decoded: '{decoded_first}'")
+                            
+                            # Check if this contains your prompt
+                            if prompt and prompt.strip():
+                                prompt_text = prompt + ": "
+                                if prompt_text in decoded_first:
+                                    print(f"DEBUG: Found prompt in sequence, visual tokens NOT included")
+                                    # Only skip prompt tokens, not visual tokens
+                                    prompt_tokens = self.tokenizer(prompt_text, return_tensors="pt")
+                                    actual_input_length = prompt_tokens.input_ids.shape[1]
+                                else:
+                                    print(f"DEBUG: Prompt not found, visual tokens might be included")
+                                    actual_input_length = input_length
+                            else:
+                                print(f"DEBUG: No prompt used")
+                                actual_input_length = 0  # No tokens to skip if no prompt
+
+                        generated_ids = outputs.sequences[:, actual_input_length:]
+
                         
                         # Decode generated tokens
                         if generated_ids.numel() > 0 and generated_ids.shape[1] > 0:
@@ -1279,7 +1405,7 @@ class MultimodalTransferLearning:
         img_embeddings = img_embeddings.to(self.device)
         
         # Use shared caption generation method
-        captions = self._generate_captions_with_prompt(img_embeddings, prompt=INFERENCE_PROMPT, max_new_tokens=50)
+        captions = self._generate_captions_with_prompt(img_embeddings, prompt=INFERENCE_PROMPT, max_new_tokens=100)
         
         # Save inference results to parquet
         img_ids = [f"inference_{i}" for i in range(len(image_paths))]
@@ -1355,6 +1481,14 @@ class MultimodalTransferLearning:
                 all_preds.extend(preds)
                 all_refs.extend(refs)
                 all_img_ids.extend(batch_img_ids)
+
+                # Show some sample predictions every 200 images
+                if current_img_id % 200 < len(preds):
+                    log.info(f"📝 Sample {split_name} predictions at image {current_img_id}:")
+                    for i in range(min(3, len(preds))):
+                        print(f"  Sample {i+1}:")
+                        print(f"    \033[92mRef:  {refs[i]}\033[0m")   # Green (reference first)
+                        print(f"    \033[93mPred: {preds[i]}\033[0m")  # Yellow (prediction second)
         
         # Compute metrics
         avg_loss = sum(eval_losses) / len(eval_losses)
@@ -1378,11 +1512,11 @@ class MultimodalTransferLearning:
         wandb.log(wandb_metrics)
         
         # Show some sample predictions
-        log.info(f"📝 Sample {split_name} predictions:")
-        for i in range(min(3, len(all_preds))):
-            print(f"  Sample {i+1}:")
-            print(f"    \033[92mRef:  {all_refs[i]}\033[0m")   # Green (reference first)
-            print(f"    \033[93mPred: {all_preds[i]}\033[0m")  # Yellow (prediction second)
+        # log.info(f"📝 Sample {split_name} predictions:")
+        # for i in range(min(3, len(all_preds))):
+        #     print(f"  Sample {i+1}:")
+        #     print(f"    \033[92mRef:  {all_refs[i]}\033[0m")   # Green (reference first)
+        #     print(f"    \033[93mPred: {all_preds[i]}\033[0m")  # Yellow (prediction second)
         
         # Return to training mode if needed
         if not test and TOP_K > 0:
