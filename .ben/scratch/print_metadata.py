@@ -12,7 +12,7 @@ def main() -> None:
     Load metadata.parquet and print the first 10 rows in full.
     """
     # adjust this path if you move the script
-    metadata_path = Path(__file__).resolve().parent.parent / "data" / "flickr30k" / "metadata.parquet"
+    metadata_path = Path(__file__).resolve().parent.parent / "data" / "reef_data" / "metadata.parquet"
     if not metadata_path.is_file():
         raise FileNotFoundError(f"Metadata file not found at {metadata_path}")
 

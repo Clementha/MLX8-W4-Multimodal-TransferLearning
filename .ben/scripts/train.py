@@ -30,14 +30,14 @@ NUM_HEADS    = 8
 NUM_LAYERS   = 6
 VAL_SPLIT    = 0.15
 
-VISION_MODEL_CHOICE = "CLIP"  # "CLIP", "ViT", or any other vision model
+VISION_MODEL_CHOICE = "ViT"  # "CLIP", "ViT", or any other vision model
 TEXT_MODEL   = "Qwen/Qwen3-Embedding-0.6B"
 
 BASE_DIR     = os.path.dirname(__file__)
-METADATA     = os.path.join(BASE_DIR, "..", "data", "flickr30k", "metadata.parquet")
-IMAGEDIR     = os.path.join(BASE_DIR, "..", "data", "flickr30k", "images")
-
-if VISION_MODEL_CHOICE == "CLIP":
+METADATA     = os.path.join(BASE_DIR, "..", "data", "reef_data", "metadata.parquet")
+IMAGEDIR     = os.path.join(BASE_DIR, "..", "data", "reef_data", "images")
+# ================
+if VISION_MODEL_CHOICE == "ViT":
     VISION_MODEL = "openai/clip-vit-base-patch32"  # default CLIP model
 if VISION_MODEL_CHOICE == "ViT":
     VISION_MODEL = "google/vit-base-patch16-224-in21k"  # default ViT model
