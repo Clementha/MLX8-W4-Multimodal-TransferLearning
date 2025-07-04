@@ -1460,6 +1460,28 @@ class MultimodalTransferLearning:
         log.info("🎯 Training complete! Running final test evaluation...")
         self.test()
 
+    def _save_checkpoint(self, epoch: int):
+        """Save model and adapter state dicts with config and epoch info."""
+        checkpoint = {
+            "qwen_state_dict": self.qwen.state_dict(),
+            "bridge_state_dict": self.bridge.state_dict(),
+            "config": {
+                "VISION_ENCODER": VISION_ENCODER,
+                "TOP_K": TOP_K,
+                "IMG_EMB_DIM": IMG_EMB_DIM,
+                "qwen_hidden_size": self.qwen_hidden_size,
+                "TRAINING_DATASET": TRAINING_DATASET,
+            },
+            "epoch": epoch + 1,
+            "model_info": {
+                "total_trainable_params": sum(p.numel() for p in list(self.qwen.parameters()) + list(self.bridge.parameters()) if p.requires_grad)
+            }
+        }
+        filename = f"{epoch+1:02d}_{VISION_ENCODER}_top{TOP_K}_{TRAINING_DATASET}.pt"
+        save_path = OUTPUT_DIR_MODELS / filename
+        torch.save(checkpoint, save_path)
+        log.info(f"💾 Saved checkpoint → {save_path}")
+        
     def test(self):
         """Run final test evaluation"""
         log.info("🧪 Running test evaluation...")

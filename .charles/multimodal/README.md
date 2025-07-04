@@ -70,6 +70,104 @@ flowchart LR
     end
 ```
 
+Friday version (GPT-4.1)
+```mermaid
+graph TD
+    A[Input Image] -->|ViT/CLIP<br>Encoder| B[Image Embedding<br/>(768 or 512-dim)]
+    B -->|ImageAdapter<br>MLP| C[16 Vision Tokens<br/>(16 x Qwen hidden size)]
+    D[Prompt/Text Caption] -->|Tokenizer| E[Text Tokens]
+    C -->|Concat| F[Sequence:<br/>[v1...v16, t1...tn]]
+    E -->|Concat| F
+    F -->|Qwen-3-0.6B<br>Language Model| G[Output:<br/>Generated Caption]
+    
+    style A fill:#f9f,stroke:#333,stroke-width:2px
+    style D fill:#bbf,stroke:#333,stroke-width:2px
+    style G fill:#bfb,stroke:#333,stroke-width:2px
+```
+Legend:
+
+ -   ViT/CLIP Encoder: Frozen vision encoder (ViT or CLIP) produces a single image embedding.
+ -   ImageAdapter MLP: Projects the image embedding to 16 vision tokens (each matching Qwen's hidden size).
+ -   Tokenizer: Converts prompt/caption to text tokens.
+ -   Concat: Vision tokens are prepended to text tokens.
+ -   Qwen-3-0.6B: Multimodal language model processes the combined sequence.
+ -   Output: Generated caption (during inference) or predicted caption (during training).
+
+
+Friday (Claude Sonnet 4)
+```mermaid
+flowchart TD
+    %% Input Stage
+    IMG[Input Image<br/>224×224 RGB] --> VISION
+    
+    %% Vision Encoder (Frozen)
+    subgraph FROZEN1 [" "]
+        VISION{Vision Encoder<br/>Choice}
+        VIT[ViT-B/16<br/>CLS Token<br/>768-dim]
+        CLIP[CLIP ViT-B/32<br/>Image Embedding<br/>512-dim]
+    end
+    
+    VISION --> VIT
+    VISION --> CLIP
+    VIT --> |IMG_EMB_DIM=768| ADAPTER
+    CLIP --> |IMG_EMB_DIM=512| ADAPTER
+    
+    %% ImageAdapter (Trainable)
+    ADAPTER[ImageAdapter MLP<br/>2-layer Bridge<br/>768/512 → 16×4096<br/>🟢 Trainable]
+    
+    %% Text Input
+    TEXT_IN[Text Caption/Prompt] --> TOKENIZER[Qwen Tokenizer]
+    TOKENIZER --> TEXT_EMB[Text Embeddings<br/>seq_len × 4096]
+    
+    %% Concatenation
+    ADAPTER --> |16 Vision Tokens| CONCAT[Concatenate<br/>[v1...v16, t1...tn]]
+    TEXT_EMB --> CONCAT
+    
+    %% Qwen Decoder
+    CONCAT --> QWEN_INPUT[Combined Sequence<br/>(16+seq_len) × 4096]
+    
+    subgraph QWEN [Qwen-3-0.6B Decoder]
+        QWEN_INPUT --> FROZEN_LAYERS[Layers 0 to 24<br/>🔵 Frozen]
+        FROZEN_LAYERS --> TRAINABLE_LAYERS[Top-K Layers 25-27<br/>🟢 Trainable<br/>K=0,1,2,3]
+        TRAINABLE_LAYERS --> LM_HEAD[LM Head<br/>4096 → vocab_size]
+    end
+    
+    %% Output
+    LM_HEAD --> OUTPUT[Generated Caption<br/>or VQA Answer]
+    
+    %% Attention Mask Logic
+    CONCAT -.-> MASK[Attention Mask<br/>Vision: attend all<br/>Text: causal mask]
+    MASK -.-> QWEN_INPUT
+    
+    %% Loss Computation
+    OUTPUT -.-> LOSS[CrossEntropy Loss<br/>Only on text tokens<br/>Vision tokens: label=-100]
+    
+    %% Styling
+    classDef frozen fill:#e6f3ff,stroke:#0066cc,stroke-width:2px
+    classDef trainable fill:#e6ffe6,stroke:#00cc00,stroke-width:2px
+    classDef input fill:#ffe6f3,stroke:#cc0066,stroke-width:2px
+    classDef output fill:#f0fff0,stroke:#009900,stroke-width:2px
+    
+    class FROZEN1,VIT,CLIP,FROZEN_LAYERS frozen
+    class ADAPTER,TRAINABLE_LAYERS trainable
+    class IMG,TEXT_IN input
+    class OUTPUT output
+```
+
+Key Architecture Details:
+
+- Frozen Vision Encoder: Either ViT-B/16 (768-d CLS token) or CLIP ViT-B/32 (512-d image embedding)
+
+- Trainable ImageAdapter: 2-layer MLP that maps single image embedding → 16 vision tokens of 4096-d (Qwen's hidden size)
+
+- Sequence Construction: [v1, v2, ..., v16, t1, t2, ..., tn] where vision tokens are prepended
+
+- Qwen Decoder: 28 layers total, only top-K layers (25-27) are trainable, rest frozen
+
+- Loss: CrossEntropy only on text tokens (vision tokens get label=-100)
+
+- Attention: Vision tokens can attend to all previous tokens, text tokens follow causal masking
+
 **Diagram key**
 
 * 🔵 **Frozen modules** – Vision encoder (ViT-B/16 *or* CLIP ViT-B/32) and most of Qwen’s 28 decoder blocks.
