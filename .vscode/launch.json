@@ -67,6 +67,15 @@
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}/.charles/multimodal",
             "args": ["--run", "test1.jpg"]
+        },
+        {
+            "name": "Python: Gradio_demo.py - Demo",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/.charles/multimodal/gradio_demo.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/.charles/multimodal",
+            "args": []
         }
     ]
 }

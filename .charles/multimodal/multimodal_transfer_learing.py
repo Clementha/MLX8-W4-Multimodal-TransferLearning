@@ -82,6 +82,9 @@ WANDB_PROJECT: str = os.getenv("WANDB_PROJECT", "mlx8-w4-multimodal-transferlear
 
 # Inference settings
 INFERENCE_PROMPT: str = os.getenv("INFERENCE_PROMPT", "Examine the image carefully and provide a detailed description covering objects, people, actions, background, and any notable visual elements")
+INFERENCE_TEMPERATURE: float = float(os.getenv("INFERENCE_TEMPERATURE", "0.5"))
+INFERENCE_TOP_P: float = float(os.getenv("INFERENCE_TOP_P", "0.92"))
+INFERENCE_TOP_K: int = int(os.getenv("INFERENCE_TOP_K", "50"))
 
 # Training prompt settings
 USE_PROMPT_VARIATION: bool = os.getenv("USE_PROMPT_VARIATION", "False").lower() == "true"
@@ -1085,15 +1088,21 @@ class MultimodalTransferLearning:
         log.info("✅ Test evaluation complete!")
 
     # --------------------------------------------------------------------- #
-    def _generate_captions_with_prompt(self, img_embeddings: torch.Tensor, prompt: str = None, max_new_tokens: int = 100) -> List[str]:
-        """Shared caption generation logic with optional prompt"""
+    def _generate_captions_with_prompt(self, img_embeddings: torch.Tensor, prompt: str = None, max_new_tokens: int = 100,
+                                       temperature: float = None, top_p: float = None, top_k: int = None) -> List[str]:
+        """Shared caption generation logic with optional prompt and inference params"""
         captions = []
         batch_size = min(BATCH_SIZE, len(img_embeddings))
         
         # Use provided prompt or default inference prompt
         if prompt is None:
             prompt = INFERENCE_PROMPT
-        
+
+        # Use provided inference params or defaults from env
+        temperature = INFERENCE_TEMPERATURE if temperature is None else temperature
+        top_p = INFERENCE_TOP_P if top_p is None else top_p
+        top_k = INFERENCE_TOP_K if top_k is None else top_k
+
         # Ensure model is in eval mode
         self.qwen.eval()
         self.bridge.eval()
@@ -1147,9 +1156,9 @@ class MultimodalTransferLearning:
                             max_new_tokens=max_new_tokens,
                             min_new_tokens=1,
                             do_sample=True,
-                            temperature=0.1,
-                            top_p=0.92,
-                            top_k=50,
+                            temperature=temperature,
+                            top_p=top_p,
+                            top_k=top_k,
                             pad_token_id=self.tokenizer.pad_token_id,
                             eos_token_id=self.tokenizer.eos_token_id,
                             repetition_penalty=1.5,
@@ -1162,7 +1171,7 @@ class MultimodalTransferLearning:
                         input_length = inputs.shape[1]
                         generated_ids = outputs.sequences[:, skip_length:] #input_length:]
 
-                        actual_input_length = 0
+                        actual_input_length = 0;
                         if outputs.sequences.shape[1] > 0:
                             # Try to decode first few tokens to see what they are
                             first_tokens = outputs.sequences[0, :min(20, outputs.sequences.shape[1])]

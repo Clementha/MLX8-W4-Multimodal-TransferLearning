@@ -13,6 +13,13 @@ from pathlib import Path
 from PIL import Image
 import time
 import logging
+import glob
+
+# Set a random seed for this session using OS entropy
+import struct
+_seed = struct.unpack("I", os.urandom(4))[0]
+random.seed(_seed)
+torch.manual_seed(_seed)
 
 # Import the main class and configurations
 from multimodal_transfer_learing import (
@@ -22,6 +29,9 @@ from multimodal_transfer_learing import (
     TRAINING_DATASET,
     SPLIT_CAPTIONS,
     INFERENCE_PROMPT,
+    INFERENCE_TEMPERATURE,
+    INFERENCE_TOP_P,
+    INFERENCE_TOP_K,
     log
 )
 
@@ -33,6 +43,8 @@ class GradioDemo:
         self.raw_dataset = None  # Store raw dataset for image access
         self.current_image = None
         self.current_embedding = None
+        self.selected_local_image = None  # Track selected local image
+        self.image_source = None  # "flickr" or "local"
         
         # Setup logging for demo
         log.info("🎮 Initializing Gradio Demo...")
@@ -89,6 +101,18 @@ class GradioDemo:
             # Create dummy dataset if loading fails
             self.raw_dataset = None
     
+    def list_local_images(self, images_dir="./images"):
+        """Return a list of image filenames in the given directory."""
+        image_files = []
+        try:
+            for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.gif"):
+                image_files.extend(glob.glob(os.path.join(images_dir, ext)))
+            # Only return basenames for dropdown
+            return [""] + [os.path.basename(f) for f in sorted(image_files)]
+        except Exception as e:
+            log.warning(f"Failed to list local images: {e}")
+            return [""]
+
     def get_random_sample(self):
         """Get a random sample from test dataset with actual image and matching embedding"""
         try:
@@ -185,13 +209,15 @@ class GradioDemo:
                 self.current_embedding = sample['embedding']
                 if not isinstance(self.current_embedding, torch.Tensor):
                     self.current_embedding = torch.tensor(self.current_embedding)
-                caption_to_display = sample['original_caption'] if 'original_caption' in sample else "No caption available"
+                caption_to_display = sample['original_caption']
                 image_to_display = Image.new('RGB', (224, 224), color='lightcoral')
             
             # Log first caption only for brevity
             first_caption = caption_to_display.split('\n')[0] if caption_to_display else "No caption"
             log.info(f"🎲 Random sample selected with first caption: {first_caption[:50]}...")
             
+            self.selected_local_image = None  # Reset local image selection on random
+            self.image_source = "flickr"
             return image_to_display, caption_to_display, ""  # Reset prediction
             
         except Exception as e:
@@ -199,15 +225,58 @@ class GradioDemo:
             placeholder_image = Image.new('RGB', (300, 300), color='red')
             return placeholder_image, f"❌ Error: {str(e)}", ""
     
-    def predict_caption(self, image_display, reference_caption):
-        """Generate caption prediction for current sample"""
+    def load_local_image(self, filename, images_dir="./images"):
+        """Load a local image by filename and set as current image for prediction."""
+        if not filename:
+            self.selected_local_image = None
+            self.image_source = None
+            return None, "", ""
+        path = os.path.join(images_dir, filename)
+        if not os.path.exists(path):
+            self.selected_local_image = None
+            self.image_source = None
+            return None, f"❌ File not found: {filename}", ""
         try:
+            image = Image.open(path).convert("RGB")
+            self.selected_local_image = image
+            self.image_source = "local"
+            self.current_embedding = None  # Will be set on predict
+            return image, "Local image selected. No reference captions.", ""
+        except Exception as e:
+            self.selected_local_image = None
+            self.image_source = None
+            log.error(f"Failed to load local image: {e}")
+            return None, f"❌ Error loading image: {e}", ""
+
+    def predict_caption(self, image_display, reference_caption, prev_predicted_caption,
+                       temperature, top_p, top_k):
+        """Generate caption prediction for current sample and append to previous predictions"""
+        try:
+            # Use the correct image source for prediction
+            if self.image_source == "local" and self.selected_local_image is not None:
+                image_to_use = self.selected_local_image
+                # Generate embedding for local image
+                if VISION_ENCODER == "vit":
+                    pixels = self.model.processor(images=image_to_use, return_tensors="pt").pixel_values
+                else:
+                    pixels = self.model.processor(images=image_to_use, return_tensors="pt").pixel_values
+                pixels = pixels.to(self.model.device)
+                with torch.no_grad():
+                    if VISION_ENCODER == "vit":
+                        embedding = self.model.vision_encoder(pixels)[0][:, 0]
+                    else:
+                        embedding = self.model.vision_encoder.get_image_features(pixel_values=pixels)[0]
+                self.current_embedding = embedding.cpu()
+            elif self.image_source == "flickr":
+                # Use the embedding from the random sample
+                pass
+            else:
+                return prev_predicted_caption or "⚠️ Please load a random sample or select a local image first"
+
             if self.current_embedding is None:
-                return "⚠️ Please load a random sample first"
-            
+                return prev_predicted_caption or "⚠️ Please load a random sample or select a local image first"
             if self.model is None:
-                return "❌ Model not loaded"
-            
+                return prev_predicted_caption or "❌ Model not loaded"
             log.info("🔮 Generating prediction...")
             
             # Ensure embedding is a proper tensor
@@ -224,113 +293,212 @@ class GradioDemo:
             predictions = self.model._generate_captions_with_prompt(
                 img_embedding, 
                 prompt=INFERENCE_PROMPT, 
-                max_new_tokens=100
+                max_new_tokens=100,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k
             )
             
             if predictions and len(predictions) > 0:
                 prediction = predictions[0]
                 log.info(f"✅ Generated prediction: {prediction[:50]}...")
-                return prediction
+                # Prefix with temperature, top-p, top-k
+                prefix = f"[t{temperature:.2f} p{top_p:.2f} k{top_k}]: "
+                prediction_line = prefix + prediction
+                # Append new prediction to previous predictions
+                if prev_predicted_caption and prev_predicted_caption.strip():
+                    return prev_predicted_caption.rstrip() + "\n" + prediction_line
+                else:
+                    return prediction_line
             else:
-                return "❌ Failed to generate prediction"
+                prefix = f"[T{temperature:.2f} P{top_p:.2f} K{top_k}]: "
+                fail_msg = prefix + "❌ Failed to generate prediction"
+                return prev_predicted_caption.rstrip() + "\n" + fail_msg if prev_predicted_caption else fail_msg
                 
         except Exception as e:
             log.error(f"❌ Prediction failed: {e}")
-            return f"❌ Error: {str(e)}"
-    
+            if prev_predicted_caption and prev_predicted_caption.strip():
+                return prev_predicted_caption.rstrip() + f"\n❌ Error: {str(e)}"
+            else:
+                return f"❌ Error: {str(e)}"
+
+    def get_model_files_info(self):
+        """Return a Markdown-formatted list of all files used by the model."""
+        files_info = []
+        try:
+            # Embedding cache file
+            split_suffix = "_split" if SPLIT_CAPTIONS else "_no_split"
+            cache_file = OUTPUT_DIR_CACHE / f"{VISION_ENCODER}_{TRAINING_DATASET}_complete{split_suffix}.pt"
+            if cache_file.exists():
+                files_info.append(f"- **Embedding Cache:** `{cache_file}`")
+            else:
+                files_info.append(f"- **Embedding Cache:** `{cache_file}` (not found)")
+
+            # Optionally, add any other files used by the model
+            # For example, config files, tokenizer, etc.
+            if hasattr(self.model, "config_path"):
+                files_info.append(f"- **Config:** `{self.model.config_path}`")
+            if hasattr(self.model, "tokenizer_path"):
+                files_info.append(f"- **Tokenizer:** `{self.model.tokenizer_path}`")
+
+            # Add images directory if used
+            images_dir = Path("./images")
+            if images_dir.exists():
+                files_info.append(f"- **Local Images Directory:** `{images_dir.resolve()}`")
+
+        except Exception as e:
+            files_info.append(f"- ⚠️ Error collecting file info: {e}")
+        return "\n".join(files_info) if files_info else "_No files found_"
+
     def create_interface(self):
         """Create the Gradio interface"""
-        
+
+        def get_env_vars():
+            import os
+            envs = os.environ
+            # Format as markdown table
+            lines = ["| Variable | Value |", "|---|---|"]
+            for k, v in sorted(envs.items()):
+                lines.append(f"| `{k}` | `{v}` |")
+            return "\n".join(lines)
+
         with gr.Blocks(title="Multimodal Transfer Learning Demo", theme=gr.themes.Soft()) as demo:
-            gr.Markdown(f"""
-            # 🎨 Multimodal Transfer Learning Demo
-            
-            **Model Configuration:**
-            - Vision Encoder: `{VISION_ENCODER.upper()}`
-            - Training Dataset: `{TRAINING_DATASET}`
-            - Caption Splitting: `{'Enabled' if SPLIT_CAPTIONS else 'Disabled'}`
-            
-            **Instructions:**
-            1. Click "Random Flickr Image and Caption" to load a test sample
-            2. Review the reference captions (Flickr30k has 5 captions per image)
-            3. Click "Predict" to generate model's caption
-            4. Compare reference vs prediction!
+            # Inject custom CSS for larger font sizes
+            gr.HTML("""
+            <style>
+            .caption-large-font textarea, .caption-large-font .prose { font-size: 1.25rem !important; }
+            </style>
             """)
-            
-            with gr.Group():
-                gr.Markdown("## 🎲 Random Sample")
-                
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        image_display = gr.Image(
-                            label="Test Image", 
-                            type="pil",
-                            height=400,
-                            interactive=False
-                        )
-                        
-                        random_button = gr.Button(
-                            "🎲 Random Flickr Image and Caption", 
-                            variant="primary",
-                            size="lg"
-                        )
+            with gr.Tab("Demo Description"):
+                gr.Markdown(f"""
+                # 🎨 Multimodal Transfer Learning Demo
+
+                Interactive web interface for testing the trained multimodal model with
+                random Flickr30k test images and real-time caption prediction.
+
+                **Instructions:**
+                1. Click "Random Flickr Image and Caption" to load a test sample
+                2. Review the reference captions (Flickr30k has 5 captions per image)
+                3. Click "Predict" to generate model's caption
+                4. Compare reference vs prediction!
+                """)
+            with gr.Tab("Model Card"):
+                gr.Markdown(f"""
+                ## 🧾 Model Card
+
+                **Model Configuration:**
+                - Vision Encoder: `{VISION_ENCODER.upper()}`
+                - Training Dataset: `{TRAINING_DATASET}`
+                - Caption Splitting: `{'Enabled' if SPLIT_CAPTIONS else 'Disabled'}`
+
+                ## 📊 Model Information
+
+                **Dataset Stats:**
+                - Test samples: `{len(self.test_dataset) if self.test_dataset else 'Loading...'}`
+                - Raw images: `{len(self.raw_dataset) if self.raw_dataset else 'Loading...'}`
+                - Captions per image: `5 (Flickr30k standard)`
+                - Inference prompt: `"{INFERENCE_PROMPT[:60]}..."`
+
+                ## 📁 Files Used by Model
+                {self.get_model_files_info()}
+                """)
+            with gr.Tab("Environment Variables"):
+                env_md = gr.Markdown(get_env_vars())
+
+            with gr.Tab("Demo"):
+                with gr.Group():
+                    gr.Markdown("## 🎲 Random Sample")
                     
-                    with gr.Column(scale=1):
-                        reference_caption = gr.Textbox(
-                            label="📝 Reference Captions (Ground Truth) - 5 captions per image",
-                            lines=8,
-                            max_lines=12,
-                            interactive=False,
-                            placeholder="Click the random button to load reference captions...\n\nEach Flickr30k image has 5 different captions,\nall will be displayed here numbered 1-5."
-                        )
+                    with gr.Row():
+                        # Image column: 40%
+                        with gr.Column(scale=4):
+                            image_display = gr.Image(
+                                label="Test Image", 
+                                type="pil",
+                                height=400,
+                                interactive=False
+                            )
+
+                            random_button = gr.Button(
+                                "🎲 Random Flickr Image and Caption", 
+                                variant="primary",
+                                size="lg"
+                            )
+                            
+                            # Dropdown for local images
+                            local_image_dropdown = gr.Dropdown(
+                                choices=self.list_local_images(),
+                                label="Or select a local image from ./images",
+                                value="",
+                                interactive=True
+                            )
                         
-                        predicted_caption = gr.Textbox(
-                            label="🤖 Predicted Caption (Model Output)",
-                            lines=4,
-                            max_lines=6,
-                            interactive=False,
-                            placeholder="Click 'Predict' to generate caption..."
-                        )
-                        
-                        predict_button = gr.Button(
-                            "🔮 Predict", 
-                            variant="secondary",
-                            size="lg"
-                        )
-            
-            # Statistics and info
-            with gr.Group():
-                gr.Markdown("## 📊 Model Information")
+                        # Captions column: 60%
+                        with gr.Column(scale=6):
+                            reference_caption = gr.Textbox(
+                                label="📝 Reference Captions (Ground Truth) - 5 captions per image",
+                                lines=6,
+                                max_lines=6,
+                                interactive=False,
+                                elem_classes=["caption-large-font"],
+                                placeholder="Click the random button to load reference captions...\n\nEach Flickr30k image has 5 different captions,\nall will be displayed here numbered 1-5."
+                            )
+                            
+                            predicted_caption = gr.Textbox(
+                                label="🤖 Predicted Caption (Model Output)",
+                                lines=12,
+                                max_lines=12,
+                                interactive=False,
+                                elem_classes=["caption-large-font"],
+                                placeholder="Click 'Predict' to generate caption..."
+                            )
+
+                            # Add inference parameter sliders
+                            temperature_slider = gr.Slider(
+                                minimum=0.0, maximum=1.0, value=INFERENCE_TEMPERATURE,
+                                step=0.01, label="Temperature"
+                            )
+                            top_p_slider = gr.Slider(
+                                minimum=0.0, maximum=1.0, value=INFERENCE_TOP_P,
+                                step=0.01, label="Top-p"
+                            )
+                            top_k_slider = gr.Slider(
+                                minimum=0, maximum=100, value=INFERENCE_TOP_K,
+                                step=1, label="Top-k"
+                            )
+                            
+                            predict_button = gr.Button(
+                                "🔮 Predict", 
+                                variant="secondary",
+                                size="lg"
+                            )
                 
-                with gr.Row():
-                    gr.Markdown(f"""
-                    **Dataset Stats:**
-                    - Test samples: `{len(self.test_dataset) if self.test_dataset else 'Loading...'}`
-                    - Raw images: `{len(self.raw_dataset) if self.raw_dataset else 'Loading...'}`
-                    - Captions per image: `5 (Flickr30k standard)`
-                    - Inference prompt: `"{INFERENCE_PROMPT[:60]}..."`
-                    """)
-            
-            # Event handlers
-            random_button.click(
-                fn=self.get_random_sample,
-                inputs=[],
-                outputs=[image_display, reference_caption, predicted_caption]
-            )
-            
-            predict_button.click(
-                fn=self.predict_caption,
-                inputs=[image_display, reference_caption],
-                outputs=[predicted_caption]
-            )
-            
-            # Load initial sample
-            demo.load(
-                fn=self.get_random_sample,
-                inputs=[],
-                outputs=[image_display, reference_caption, predicted_caption]
-            )
-        
+                # Event handlers
+                random_button.click(
+                    fn=self.get_random_sample,
+                    inputs=[],
+                    outputs=[image_display, reference_caption, predicted_caption]
+                )
+
+                local_image_dropdown.change(
+                    fn=lambda filename: self.load_local_image(filename),
+                    inputs=[local_image_dropdown],
+                    outputs=[image_display, reference_caption, predicted_caption]
+                )
+                
+                predict_button.click(
+                    fn=self.predict_caption,
+                    inputs=[image_display, reference_caption, predicted_caption,
+                            temperature_slider, top_p_slider, top_k_slider],
+                    outputs=[predicted_caption]
+                )
+                
+                # Load initial sample
+                demo.load(
+                    fn=self.get_random_sample,
+                    inputs=[],
+                    outputs=[image_display, reference_caption, predicted_caption]
+                )
         return demo
 
 def launch_demo(share=False, server_port=7860):
