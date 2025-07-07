@@ -15,6 +15,10 @@ import time
 import logging
 import glob
 
+# Load .env file for environment variables
+from dotenv import load_dotenv
+load_dotenv()
+
 # Set a random seed for this session using OS entropy
 import struct
 _seed = struct.unpack("I", os.urandom(4))[0]
@@ -501,7 +505,7 @@ class GradioDemo:
                 )
         return demo
 
-def launch_demo(share=False, server_port=7860):
+def launch_demo(share=False, server_port=8081):
     """Launch the Gradio demo"""
     try:
         log.info("🚀 Starting Gradio Demo...")
@@ -528,10 +532,13 @@ def launch_demo(share=False, server_port=7860):
 
 if __name__ == "__main__":
     import argparse
+
+    # Read port from environment variable, default to 8081 if not set
+    env_port = int(os.environ.get("GRADIO_PORT", 8081))
     
     parser = argparse.ArgumentParser(description="Launch Gradio Demo")
     parser.add_argument("--share", action="store_true", help="Create public share link")
-    parser.add_argument("--port", type=int, default=7860, help="Server port (default: 7860)")
+    parser.add_argument("--port", type=int, default=env_port, help="Server port (default: from .env PORT or 8081)")
     
     args = parser.parse_args()
     
