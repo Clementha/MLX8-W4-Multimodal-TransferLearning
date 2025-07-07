@@ -21,7 +21,7 @@ from typing import Iterable, List
 from PIL import Image  # pip install pillow  (pillow-simd is even faster)
 
 # -------- GLOBALS ----------------------------------------------------
-SRC_DIR = Path("/media/bwilliams/New Volume1/mars_hackathon")
+SRC_DIR = Path("/home/bwilliams/mlx/week4/MLX8-W4-Multimodal-TransferLearning/.ben/scratch/scratch_data")
 DEST_DIR = SRC_DIR / "dwn_sampld"
 
 TARGET_PX = 800          # longest edge after resizing
